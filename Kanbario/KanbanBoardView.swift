@@ -124,8 +124,11 @@ struct KanbanColumn: View {
             }
             return NSItemProvider(object: id.uuidString as NSString)
         }, preview: {
-            TaskCardDragPreview(task: task, accent: statusTint)
-                .frame(width: 260)
+            // preview を EmptyView にすることで cursor 追従の浮遊カードを出さない。
+            // drop 時に「preview がその場に残って消える」違和感を完全排除。
+            // 「何を drag してるか」は source card (opacity 0 で不在) と drop target 列の
+            // highlight で周辺文脈として伝わる。
+            EmptyView()
         })
         // transition は両方向 instant。insertion アニメを削除することで
         // drop → 新列にカードが「ふわっと現れる」時間を無くし、macOS preview の
