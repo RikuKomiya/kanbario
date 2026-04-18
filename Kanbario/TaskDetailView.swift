@@ -8,6 +8,9 @@ struct TaskDetailView: View {
     /// Start ボタン連打防止。startTask が await している間 true。
     @State private var isStarting = false
 
+    /// Claude に送る入力欄。TextField バインド用。
+    @State private var inputText: String = ""
+
     var body: some View {
         Group {
             if let task = appState.selectedTask {
@@ -94,6 +97,11 @@ struct TaskDetailView: View {
                         )
                 }
 
+                // セッションログ (claude 稼働中 or 終了後にログがあれば表示)
+                if shouldShowSession(task) {
+                    sessionPane(for: task)
+                }
+
                 // Milestone C: Start ボタン
                 HStack {
                     Button {
@@ -131,6 +139,101 @@ struct TaskDetailView: View {
     /// かつ起動中でない時のみ true。
     private func canStart(_ task: TaskCard) -> Bool {
         task.status == .planning && appState.canStartTasks && !isStarting
+    }
+
+    /// セッションログを表示する条件: claude が動いている、または過去に動いて
+    /// ログが残っている場合のみ出す。planning (未起動) では出さない。
+    private func shouldShowSession(_ task: TaskCard) -> Bool {
+        if appState.activeSessions[task.id] != nil { return true }
+        if let log = appState.sessionLogs[task.id], !log.isEmpty { return true }
+        return false
+    }
+
+    /// ターミナル風のログ + 入力欄 + Stop ボタンをまとめたペイン。
+    /// libghostty 導入前の暫定 UI。ANSI は AppState.stripANSI で剥がされた
+    /// プレーンテキストが来る前提。
+    @ViewBuilder
+    private func sessionPane(for task: TaskCard) -> some View {
+        let isRunning = appState.activeSessions[task.id] != nil
+        let log = appState.sessionLogs[task.id] ?? ""
+        let exitCode = appState.sessionExitCodes[task.id]
+
+        VStack(alignment: .leading, spacing: 6) {
+            // ヘッダ: 状態 + Stop ボタン
+            HStack(spacing: 6) {
+                Image(systemName: isRunning ? "terminal.fill" : "terminal")
+                    .font(.caption)
+                    .foregroundStyle(isRunning ? .green : .secondary)
+                Text("Session")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                if isRunning {
+                    Text("running")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                } else if let code = exitCode {
+                    Text("exited (\(code))")
+                        .font(.caption2)
+                        .foregroundStyle(code == 0 ? Color.secondary : Color.orange)
+                }
+                Spacer()
+                if isRunning {
+                    Button(role: .destructive) {
+                        Task { await appState.stopTask(id: task.id) }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "stop.fill")
+                            Text("Stop")
+                        }
+                    }
+                    .controlSize(.small)
+                    .help("SIGTERM を送って claude を止める")
+                }
+            }
+
+            // ログ本体。bottom marker を使って新しい行が来たら下端に追従する。
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(log.isEmpty ? "(no output yet)" : log)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .id("log-content")
+                    Color.clear
+                        .frame(height: 1)
+                        .id("log-bottom")
+                }
+                .frame(minHeight: 160, maxHeight: 280)
+                .background(Color.black.opacity(0.78))
+                .foregroundStyle(.green.opacity(0.92))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .onChange(of: log) { _, _ in
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        proxy.scrollTo("log-bottom", anchor: .bottom)
+                    }
+                }
+            }
+
+            // 入力欄 (running 時のみ)。Enter で送信、Send ボタンでも送信。
+            if isRunning {
+                HStack(spacing: 6) {
+                    TextField("Send to Claude (Enter to submit)", text: $inputText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .onSubmit { submitInput(taskID: task.id) }
+                    Button("Send") { submitInput(taskID: task.id) }
+                        .buttonStyle(.bordered)
+                        .disabled(inputText.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func submitInput(taskID: UUID) {
+        let text = inputText
+        inputText = ""
+        Task { await appState.sendInput(taskID: taskID, text: text) }
     }
 
     /// 押せない理由を tooltip で開示する。

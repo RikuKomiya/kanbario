@@ -28,6 +28,17 @@ final class AppState {
     /// done 時の cleanup 対象を引くのに使う。
     var activeSessions: [UUID: SessionManager.SessionID] = [:]
 
+    /// Claude の stdout を積むバッファ。taskID -> tail (最大 `maxLogBytes` 文字)。
+    /// ANSI escape は粗く剥がして可読テキストに寄せる (perfect な TUI 再描画は
+    /// libghostty 導入後に任せる。いまは「何が起きているか」を確認できれば十分)。
+    var sessionLogs: [UUID: String] = [:]
+
+    /// セッション終了時の exit code。review 状態の下に表示する。
+    var sessionExitCodes: [UUID: Int32] = [:]
+
+    /// 1 セッションあたりのログ tail 上限。これを超えたら先頭を捨てる。
+    private static let maxLogBytes = 8 * 1024
+
     /// デモ用のデフォルトプロジェクト。MVP は 1 プロジェクト前提。
     let defaultProject: Project
 
@@ -169,15 +180,27 @@ final class AppState {
                 task: task, worktreeURL: worktreeURL
             )
             activeSessions[task.id] = session.id
+            sessionLogs[task.id] = ""
+            sessionExitCodes.removeValue(forKey: task.id)
             applyStatus(id: task.id, to: .inProgress)
+
+            let taskID = task.id
+
+            // PTY stdout を吸い出して sessionLogs[taskID] に追記する。ANSI を
+            // 剥がして読める形にする (libghostty 導入まではこれで凌ぐ)。
+            _Concurrency.Task { @MainActor [weak self] in
+                for await chunk in session.bytes {
+                    self?.appendLog(taskID: taskID, data: chunk)
+                }
+            }
 
             // PTY 終端を監視して自動で review に飛ばす。
             // Session は actor 越しの class なので capture に weak は不要 (session 自身は
             // SessionManager が保持)。終了後に activeSessions から drop。
-            let taskID = task.id
             _Concurrency.Task { @MainActor [weak self] in
-                for await _ in session.termination {
+                for await exitCode in session.termination {
                     guard let self else { return }
+                    self.sessionExitCodes[taskID] = exitCode
                     self.activeSessions.removeValue(forKey: taskID)
                     self.applyStatus(id: taskID, to: .review)
                 }
@@ -185,6 +208,65 @@ final class AppState {
         } catch {
             lastError = "Start failed: \(error)"
         }
+    }
+
+    /// 手動で claude を止める。SIGTERM 送信 → PTY EOF → termination watcher
+    /// 経由で review に遷移する。
+    func stopTask(id: UUID) async {
+        guard let sessionID = activeSessions[id] else { return }
+        await sessionManager.kill(id: sessionID)
+    }
+
+    /// 標準入力に文字列を流す (末尾に \n を足す)。
+    /// 返り値は成功/失敗の情報を出すためだが、UI はいまは気にしない。
+    func sendInput(taskID: UUID, text: String) async {
+        guard let sessionID = activeSessions[taskID] else { return }
+        let bytes = (text + "\n").data(using: .utf8) ?? Data()
+        do {
+            try await sessionManager.write(to: sessionID, bytes: bytes)
+        } catch {
+            lastError = "入力送信失敗: \(error)"
+        }
+    }
+
+    /// PTY から届いたバイトを String に落として ANSI を粗く剥がしてから追記する。
+    /// tail 上限を超えたら先頭を捨てる (log が無限増殖しないように)。
+    private func appendLog(taskID: UUID, data: Data) {
+        guard let text = String(data: data, encoding: .utf8) else { return }
+        let cleaned = Self.stripANSI(text)
+        var current = sessionLogs[taskID, default: ""]
+        current += cleaned
+        if current.count > Self.maxLogBytes {
+            current = String(current.suffix(Self.maxLogBytes))
+        }
+        sessionLogs[taskID] = current
+    }
+
+    /// ANSI CSI シーケンス (`ESC[...letter`) と単発制御文字を剥がす。
+    /// 完全な VT 解釈ではないが、claude TUI の出力から可読テキストを拾うには十分。
+    static func stripANSI(_ s: String) -> String {
+        // CSI (cursor pos、色など) を削除
+        var out = s.replacingOccurrences(
+            of: "\u{001B}\\[[0-9;?]*[A-Za-z]",
+            with: "",
+            options: .regularExpression
+        )
+        // OSC (タイトル設定等) を BEL / ESC\ まで削除
+        out = out.replacingOccurrences(
+            of: "\u{001B}\\][^\u{0007}\u{001B}]*(\u{0007}|\u{001B}\\\\)",
+            with: "",
+            options: .regularExpression
+        )
+        // 残った単発 ESC + 次の 1 文字を削除 (=, >, M, 7, 8 等)
+        out = out.replacingOccurrences(
+            of: "\u{001B}.",
+            with: "",
+            options: .regularExpression
+        )
+        // キャリッジリターンは改行に寄せる (スクロール表示を楽にするため)
+        out = out.replacingOccurrences(of: "\r\n", with: "\n")
+        out = out.replacingOccurrences(of: "\r", with: "\n")
+        return out
     }
 
     /// review → done drag で呼ばれる。claude kill → wt remove → done へ遷移。
