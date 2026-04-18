@@ -58,12 +58,18 @@ struct KanbanColumn: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(isTargeted ? statusTint.opacity(0.6) : Color.clear, lineWidth: 2)
         )
-        .dropDestination(for: TaskDrag.self) { drags, _ in
+        // NSItemProvider(object: NSString) で drag したので、drop 側は String を受ける。
+        // String を UUID にパースして moveTask を呼ぶ。drop 成功で draggingTaskID を
+        // クリアし、source card の opacity を 1 に戻す。
+        .dropDestination(for: String.self) { strings, _ in
             withAnimation(.smooth(duration: 0.28)) {
-                for drag in drags {
-                    appState.moveTask(id: drag.id, to: status)
+                for s in strings {
+                    if let id = UUID(uuidString: s) {
+                        appState.moveTask(id: id, to: status)
+                    }
                 }
             }
+            appState.draggingTaskID = nil
             return true
         } isTargeted: { isTargeted = $0 }
     }
@@ -83,11 +89,26 @@ struct KanbanColumn: View {
             )
         }
         .buttonStyle(.plain)
-        .draggable(TaskDrag(id: task.id)) {
-            // Drag preview: @Environment を使わない独立 View
+        // drag 中は source card を完全に非表示 (opacity 0)。SwiftUI 標準の
+        // 半透明残像を消して、「drag state UI = cursor 追従の preview のみ」にする。
+        .opacity(appState.draggingTaskID == task.id ? 0 : 1)
+        // .onDrag は .draggable と違い drag 開始時に closure が発火する。
+        // ここで draggingTaskID を set して opacity 条件を true にする。
+        // 保険として 8 秒後に自動クリア (drag cancel で drop callback が発火しない場合対策)。
+        .onDrag({
+            let id = task.id
+            appState.draggingTaskID = id
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(8))
+                if appState.draggingTaskID == id {
+                    appState.draggingTaskID = nil
+                }
+            }
+            return NSItemProvider(object: id.uuidString as NSString)
+        }, preview: {
             TaskCardDragPreview(task: task, accent: statusTint)
                 .frame(width: 260)
-        }
+        })
         .transition(.asymmetric(
             // 旧列から消える時は instant (残像を残さない)、新列に入る時だけ scale-in
             insertion: .opacity.combined(with: .scale(scale: 0.95)),

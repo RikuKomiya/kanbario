@@ -13,6 +13,10 @@ final class AppState {
     /// 詳細画面に表示中のタスク。nil なら詳細なし。
     var selectedTaskID: UUID?
 
+    /// 現在 drag 中のタスク ID。drag 開始時に set、drop または timeout で nil に戻る。
+    /// UI 側で source card を opacity 0 にするのに使う。
+    var draggingTaskID: UUID?
+
     /// デモ用のデフォルトプロジェクト。MVP は 1 プロジェクト前提。
     let defaultProject: Project
 
