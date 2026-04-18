@@ -67,17 +67,15 @@ struct KanbanColumn: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(isTargeted ? statusTint.opacity(0.6) : Color.clear, lineWidth: 2)
         )
-        // NSItemProvider(object: NSString) で drag したので、drop 側は String を受ける。
-        // draggingTaskID を先にクリアしてから moveTask を呼ぶ。順序を逆にすると、
-        // 新列に挿入される新 View が render 時に draggingTaskID == task.id と見えて
-        // opacity 0 で出現 → 新列で表示されないバグが起きる。
+        // drop は withAnimation しない = SwiftUI 側は即時状態反映。
+        // macOS の drop-complete アニメ (preview が drop 地点にフェード) と
+        // SwiftUI の insertion アニメが重なって「drag 状態が続いて見える」のを防ぐ。
+        // draggingTaskID も先にクリアして opacity を即復帰。
         .dropDestination(for: String.self) { strings, _ in
             appState.draggingTaskID = nil
-            withAnimation(.smooth(duration: 0.28)) {
-                for s in strings {
-                    if let id = UUID(uuidString: s) {
-                        appState.moveTask(id: id, to: status)
-                    }
+            for s in strings {
+                if let id = UUID(uuidString: s) {
+                    appState.moveTask(id: id, to: status)
                 }
             }
             return true
@@ -129,11 +127,10 @@ struct KanbanColumn: View {
             TaskCardDragPreview(task: task, accent: statusTint)
                 .frame(width: 260)
         })
-        .transition(.asymmetric(
-            // 旧列から消える時は instant (残像を残さない)、新列に入る時だけ scale-in
-            insertion: .opacity.combined(with: .scale(scale: 0.95)),
-            removal:   .identity
-        ))
+        // transition は両方向 instant。insertion アニメを削除することで
+        // drop → 新列にカードが「ふわっと現れる」時間を無くし、macOS preview の
+        // 消えアニメが終わるより前に kanbario 側の UI が最終状態になる。
+        .transition(.identity)
     }
 
     // MARK: - Subviews
