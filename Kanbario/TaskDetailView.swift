@@ -5,6 +5,9 @@ import SwiftUI
 struct TaskDetailView: View {
     @Environment(AppState.self) private var appState
 
+    /// Start ボタン連打防止。startTask が await している間 true。
+    @State private var isStarting = false
+
     var body: some View {
         Group {
             if let task = appState.selectedTask {
@@ -91,21 +94,30 @@ struct TaskDetailView: View {
                         )
                 }
 
-                // Milestone C 予定のアクション
+                // Milestone C: Start ボタン
                 HStack {
                     Button {
-                        // TODO: Phase C
+                        isStarting = true
+                        Task {
+                            await appState.startTask(task)
+                            isStarting = false
+                        }
                     } label: {
                         HStack(spacing: 6) {
-                            Image(systemName: "play.fill")
-                            Text("Start")
+                            if isStarting {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "play.fill")
+                            }
+                            Text(isStarting ? "Starting…" : "Start")
                         }
-                        .frame(minWidth: 80)
+                        .frame(minWidth: 90)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(task.status != .planning)
-                    .help(task.status == .planning ? "Start Claude (Milestone C)" : "Only planning tasks can be started")
+                    .disabled(!canStart(task))
+                    .help(startHelpText(task))
 
                     Spacer()
                 }
@@ -113,6 +125,20 @@ struct TaskDetailView: View {
             }
             .padding(18)
         }
+    }
+
+    /// Start ボタンが押せるかの判定。planning 状態かつリポジトリ設定済み、
+    /// かつ起動中でない時のみ true。
+    private func canStart(_ task: TaskCard) -> Bool {
+        task.status == .planning && appState.canStartTasks && !isStarting
+    }
+
+    /// 押せない理由を tooltip で開示する。
+    private func startHelpText(_ task: TaskCard) -> String {
+        if task.status != .planning { return "Only planning tasks can be started" }
+        if !appState.canStartTasks { return "Choose a repository first (toolbar)" }
+        if isStarting { return "Starting…" }
+        return "Start Claude (wt switch + claude spawn)"
     }
 
     private var placeholder: some View {
