@@ -89,8 +89,9 @@ struct KanbanColumn: View {
                 .frame(width: 260)
         }
         .transition(.asymmetric(
+            // 旧列から消える時は instant (残像を残さない)、新列に入る時だけ scale-in
             insertion: .opacity.combined(with: .scale(scale: 0.95)),
-            removal:   .opacity
+            removal:   .identity
         ))
     }
 
