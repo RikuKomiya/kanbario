@@ -91,6 +91,11 @@ actor SessionManager {
         env["KANBARIO_SURFACE_ID"] = task.id.uuidString
         env["KANBARIO_TASK_ID"] = task.id.uuidString
         env["TERM"] = env["TERM"] ?? "xterm-256color"
+        // GUI (Xcode/Finder) 起動のアプリは launchd の細い PATH を継承するため、
+        // ユーザの .zshrc で足された Homebrew / node 系のパスが効かない。
+        // claude 側の stop hook (node 実行) や MCP クライアントがコケるので、
+        // 典型的な user-local bin を前置しておく。
+        env["PATH"] = Self.augmentedPATH(current: env["PATH"])
 
         return try await start(
             executable: executable,
@@ -98,6 +103,38 @@ actor SessionManager {
             cwd: worktreeURL,
             environment: env
         )
+    }
+
+    /// 子プロセスに渡す PATH を補う。launchd 継承の貧弱な PATH の手前に
+    /// user-local bin を挿す。既に同じパスがあれば重複させない。
+    ///
+    /// 候補は「Mac 開発機でよく登場する dev toolchain の bin 位置」:
+    ///   - ~/.local/bin, ~/.volta/bin, ~/.cargo/bin, ~/.bun/bin, ~/.deno/bin
+    ///   - /opt/homebrew/{bin,sbin} (Apple Silicon Homebrew)
+    ///   - /usr/local/{bin,sbin} (Intel Homebrew / 手動インストール)
+    ///
+    /// これでも足りないユーザー (asdf / mise 等) は Settings で PATH 指定できる
+    /// ようにするのが将来の拡張。MVP では hardcode で 9 割のケースを拾う。
+    static func augmentedPATH(current: String?) -> String {
+        let home = NSHomeDirectory()
+        let additions = [
+            "\(home)/.local/bin",
+            "\(home)/.volta/bin",
+            "\(home)/.cargo/bin",
+            "\(home)/.bun/bin",
+            "\(home)/.deno/bin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+        ]
+        let existing = (current ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for p in additions + existing where !p.isEmpty {
+            if seen.insert(p).inserted { ordered.append(p) }
+        }
+        return ordered.joined(separator: ":")
     }
 
     /// PATH から実行可能ファイルを探す。Xcode ランナーの PATH は絞られているので
