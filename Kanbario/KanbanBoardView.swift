@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreGraphics
 
 /// Kanban ボード本体。4 列を横並びで表示する。
 struct KanbanBoardView: View {
@@ -103,15 +104,24 @@ struct KanbanColumn: View {
         .opacity(appState.draggingTaskID == task.id ? 0 : 1)
         // .onDrag は .draggable と違い drag 開始時に closure が発火する。
         // ここで draggingTaskID を set して opacity 条件を true にする。
-        // 保険 timeout: ウィンドウ外や macOS の drop 受け入れないエリアで放した場合の
-        // 最終的な cleanup。1 秒で十分 (通常は board の outer dropDestination で即クリア)。
+        //
+        // drag 終了検知: SwiftUI には drag-end callback が無いので、CGEventSource で
+        // マウスボタン state を 30ms 間隔で polling。どこで放しても (他アプリ上、
+        // ウィンドウ外、デスクトップ) 検知できる。drop 成功時は dropDestination の
+        // callback が先に発火してクリアするので、polling タスクは次の tick で自然に exit。
         .onDrag({
             let id = task.id
             appState.draggingTaskID = id
             Task { @MainActor in
-                try? await Task.sleep(for: .seconds(1))
-                if appState.draggingTaskID == id {
-                    appState.draggingTaskID = nil
+                while appState.draggingTaskID == id {
+                    // .combinedSessionState はハードウェア + 他プロセスからの合成状態。
+                    // trackpad の drag でも press 状態として乗ってくる。
+                    let pressed = CGEventSource.buttonState(.combinedSessionState, button: .left)
+                    if !pressed {
+                        appState.draggingTaskID = nil
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(30))
                 }
             }
             return NSItemProvider(object: id.uuidString as NSString)
