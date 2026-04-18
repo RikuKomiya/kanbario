@@ -15,6 +15,14 @@ struct KanbanBoardView: View {
         }
         .padding(14)
         .background(Color(.windowBackgroundColor))
+        // 列の外 (board 内の余白) で drop された場合の catch-all。
+        // 列の dropDestination が優先されるので、列で受け付けられる drop は
+        // ここに来ない。列の外で放された時だけ走って draggingTaskID をクリアする
+        // (= source card がすぐに再表示される)。return false で実際の drop は拒否。
+        .dropDestination(for: String.self) { _, _ in
+            appState.draggingTaskID = nil
+            return false
+        }
     }
 }
 
@@ -59,9 +67,11 @@ struct KanbanColumn: View {
                 .stroke(isTargeted ? statusTint.opacity(0.6) : Color.clear, lineWidth: 2)
         )
         // NSItemProvider(object: NSString) で drag したので、drop 側は String を受ける。
-        // String を UUID にパースして moveTask を呼ぶ。drop 成功で draggingTaskID を
-        // クリアし、source card の opacity を 1 に戻す。
+        // draggingTaskID を先にクリアしてから moveTask を呼ぶ。順序を逆にすると、
+        // 新列に挿入される新 View が render 時に draggingTaskID == task.id と見えて
+        // opacity 0 で出現 → 新列で表示されないバグが起きる。
         .dropDestination(for: String.self) { strings, _ in
+            appState.draggingTaskID = nil
             withAnimation(.smooth(duration: 0.28)) {
                 for s in strings {
                     if let id = UUID(uuidString: s) {
@@ -69,7 +79,6 @@ struct KanbanColumn: View {
                     }
                 }
             }
-            appState.draggingTaskID = nil
             return true
         } isTargeted: { isTargeted = $0 }
     }
@@ -94,12 +103,13 @@ struct KanbanColumn: View {
         .opacity(appState.draggingTaskID == task.id ? 0 : 1)
         // .onDrag は .draggable と違い drag 開始時に closure が発火する。
         // ここで draggingTaskID を set して opacity 条件を true にする。
-        // 保険として 8 秒後に自動クリア (drag cancel で drop callback が発火しない場合対策)。
+        // 保険 timeout: ウィンドウ外や macOS の drop 受け入れないエリアで放した場合の
+        // 最終的な cleanup。1 秒で十分 (通常は board の outer dropDestination で即クリア)。
         .onDrag({
             let id = task.id
             appState.draggingTaskID = id
             Task { @MainActor in
-                try? await Task.sleep(for: .seconds(8))
+                try? await Task.sleep(for: .seconds(1))
                 if appState.draggingTaskID == id {
                     appState.draggingTaskID = nil
                 }
