@@ -1,0 +1,28 @@
+# Claude Code personal settings
+.claude/settings.local.json
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Swift Package Manager
+.swiftpm/
+Packages/
+Package.pins
+Package.resolved
+.build/
+
+# macOS
+.DS_Store
+
+# libghostty vendored artifacts
+vendor/libghostty/
+
+# App runtime data (never commit user data)
+*.app/Contents/Resources/bin/claude.real
