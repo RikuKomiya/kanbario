@@ -53,6 +53,12 @@ final class AppState {
         return tasks.first(where: { $0.id == id })
     }
 
+    /// drag 中のタスク (無ければ nil)。drop 先 column のゴーストカード表示に使う。
+    var draggingTask: TaskCard? {
+        guard let id = draggingTaskID else { return nil }
+        return tasks.first(where: { $0.id == id })
+    }
+
     // MARK: - Mutations
 
     /// 新規タスクを planning 列に追加する。

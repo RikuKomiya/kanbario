@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreGraphics
+import UniformTypeIdentifiers
 
 /// Kanban ボード本体。4 列を横並びで表示する。
 struct KanbanBoardView: View {
@@ -16,14 +17,6 @@ struct KanbanBoardView: View {
         }
         .padding(14)
         .background(Color(.windowBackgroundColor))
-        // 列の外 (board 内の余白) で drop された場合の catch-all。
-        // 列の dropDestination が優先されるので、列で受け付けられる drop は
-        // ここに来ない。列の外で放された時だけ走って draggingTaskID をクリアする
-        // (= source card がすぐに再表示される)。return false で実際の drop は拒否。
-        .dropDestination(for: String.self) { _, _ in
-            appState.draggingTaskID = nil
-            return false
-        }
     }
 }
 
@@ -45,7 +38,6 @@ struct KanbanColumn: View {
             Divider().opacity(0.4)
 
             ScrollView(showsIndicators: false) {
-                // 小さなカード数なら LazyVStack は不要 (lazy が drag 中に flicker の原因)
                 VStack(spacing: 8) {
                     if tasks.isEmpty {
                         emptyState
@@ -54,6 +46,16 @@ struct KanbanColumn: View {
                         ForEach(tasks) { task in
                             taskRow(task)
                         }
+                    }
+                    // Ghost placeholder: drag 中、cursor がこの列に入っていて
+                    // かつ source が別列の時だけ、末尾に「ここに落ちる」プレビューを出す。
+                    // OS の drag preview は AppKit 管理で再描画が効かないので、
+                    // SwiftUI view tree 内のこのゴーストが drop-location の主要な視覚シグナル。
+                    if let dragging = appState.draggingTask,
+                       dragging.status != status,
+                       isTargeted {
+                        DropPlaceholderCard(task: dragging, accent: statusTint)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     }
                 }
                 .padding(.horizontal, 8)
@@ -67,26 +69,19 @@ struct KanbanColumn: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(isTargeted ? statusTint.opacity(0.6) : Color.clear, lineWidth: 2)
         )
-        // drop は withAnimation しない = SwiftUI 側は即時状態反映。
-        // macOS の drop-complete アニメ (preview が drop 地点にフェード) と
-        // SwiftUI の insertion アニメが重なって「drag 状態が続いて見える」のを防ぐ。
-        // draggingTaskID も先にクリアして opacity を即復帰。
-        .dropDestination(for: String.self) { strings, _ in
-            appState.draggingTaskID = nil
-            for s in strings {
-                if let id = UUID(uuidString: s) {
-                    appState.moveTask(id: id, to: status)
-                }
-            }
-            return true
-        } isTargeted: { isTargeted = $0 }
+        .onDrop(of: [.utf8PlainText], delegate: KanbanColumnDropDelegate(
+            status: status,
+            appState: appState,
+            isTargeted: $isTargeted
+        ))
+        .animation(.easeInOut(duration: 0.15), value: isTargeted)
+        .animation(.easeInOut(duration: 0.15), value: appState.draggingTaskID)
     }
 
     // MARK: - Row
 
     @ViewBuilder
     private func taskRow(_ task: TaskCard) -> some View {
-        // Button + .plain で tap を処理 (onTapGesture と違い、draggable との干渉が少ない)
         Button {
             appState.selectedTaskID = task.id
         } label: {
@@ -97,23 +92,25 @@ struct KanbanColumn: View {
             )
         }
         .buttonStyle(.plain)
-        // drag 中は source card を完全に非表示 (opacity 0)。SwiftUI 標準の
-        // 半透明残像を消して、「drag state UI = cursor 追従の preview のみ」にする。
+        // drag 中は source card を opacity 0 で隠す。
         .opacity(appState.draggingTaskID == task.id ? 0 : 1)
-        // .onDrag は .draggable と違い drag 開始時に closure が発火する。
-        // ここで draggingTaskID を set して opacity 条件を true にする。
+        // preview closure を渡さず、OS default の view snapshot に任せる (langwatch/kanban-code 方式)。
+        // 理由:
+        // - EmptyView / 1x1 Color.clear preview では drag 中の視認性が失われる / crash
+        // - 自前 preview (opacity binding) は AppKit NSImage に焼き付いてしまい再描画されない
+        // - SwiftUI の範囲で drop 残像を消す API は存在しない (NSDraggingSession.animatesToDestination
+        //   は NSViewRepresentable まで降りないと触れない)
+        // → drop 時の AppKit 標準 fade アニメは macOS 流儀として受け入れ、ユーザの視線は
+        //   DropPlaceholderCard のゴースト消滅 + 新列への instant 出現に誘導する。
         //
-        // drag 終了検知: SwiftUI には drag-end callback が無いので、CGEventSource で
-        // マウスボタン state を 30ms 間隔で polling。どこで放しても (他アプリ上、
-        // ウィンドウ外、デスクトップ) 検知できる。drop 成功時は dropDestination の
-        // callback が先に発火してクリアするので、polling タスクは次の tick で自然に exit。
-        .onDrag({
+        // drag 終了検知: CGEventSource で mouse button を 30ms polling。DropDelegate の
+        // dropExited は列外ヒットでしか発火しないため、ウィンドウ外で release された時の
+        // state cleanup に必要。
+        .onDrag {
             let id = task.id
             appState.draggingTaskID = id
             Task { @MainActor in
                 while appState.draggingTaskID == id {
-                    // .combinedSessionState はハードウェア + 他プロセスからの合成状態。
-                    // trackpad の drag でも press 状態として乗ってくる。
                     let pressed = CGEventSource.buttonState(.combinedSessionState, button: .left)
                     if !pressed {
                         appState.draggingTaskID = nil
@@ -123,16 +120,7 @@ struct KanbanColumn: View {
                 }
             }
             return NSItemProvider(object: id.uuidString as NSString)
-        }, preview: {
-            // preview を EmptyView にすることで cursor 追従の浮遊カードを出さない。
-            // drop 時に「preview がその場に残って消える」違和感を完全排除。
-            // 「何を drag してるか」は source card (opacity 0 で不在) と drop target 列の
-            // highlight で周辺文脈として伝わる。
-            EmptyView()
-        })
-        // transition は両方向 instant。insertion アニメを削除することで
-        // drop → 新列にカードが「ふわっと現れる」時間を無くし、macOS preview の
-        // 消えアニメが終わるより前に kanbario 側の UI が最終状態になる。
+        }
         .transition(.identity)
     }
 
@@ -187,8 +175,55 @@ struct KanbanColumn: View {
     }
 }
 
+// MARK: - Drop handling
+
+/// 列ごとの drop handler。
+/// - `dropUpdated` で `DropProposal(operation: .move / .forbidden)` を返すと
+///   cursor に `+` / `⊘` マークが出て drop 可否がユーザーに伝わる。
+/// - `performDrop` はペイロード (UUID 文字列) を pasteboard 経由で読まず、
+///   `appState.draggingTaskID` を直接参照する (state がすでに在ることを利用して async な
+///   `loadObject` を避け、drop 応答を同期にする)。
+struct KanbanColumnDropDelegate: DropDelegate {
+    let status: TaskStatus
+    let appState: AppState
+    @Binding var isTargeted: Bool
+
+    func dropEntered(info: DropInfo) {
+        isTargeted = true
+    }
+
+    func dropExited(info: DropInfo) {
+        isTargeted = false
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard let id = appState.draggingTaskID,
+              let current = appState.tasks.first(where: { $0.id == id })?.status
+        else {
+            return DropProposal(operation: .forbidden)
+        }
+        // 同じ列への drop は「何もしない」だが、forbidden 扱いにすると
+        // source 列 hover 中に赤マークが出て違和感があるので許可扱い。
+        if current == status { return DropProposal(operation: .move) }
+        return current.canTransition(to: status)
+            ? DropProposal(operation: .move)
+            : DropProposal(operation: .forbidden)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        defer {
+            appState.draggingTaskID = nil
+            isTargeted = false
+        }
+        guard let id = appState.draggingTaskID else { return false }
+        appState.moveTask(id: id, to: status)
+        return true
+    }
+}
+
+// MARK: - Cards
+
 /// カード 1 枚分の表示 View。@Environment を読まない純粋な presentation。
-/// Drag preview でも再利用するため selection state を parameter として受ける。
 struct TaskCardView: View {
     let task: TaskCard
     var accent: Color = .gray
@@ -246,38 +281,33 @@ struct TaskCardView: View {
     }
 }
 
-/// Drag preview 用。独立した軽量 View で @Environment 非依存。
-struct TaskCardDragPreview: View {
+/// Drop 先 column に挿入される半透明プレースホルダ。
+/// OS の drag preview と違い SwiftUI view tree の一員なので、`isTargeted` の
+/// 変化に対して `.transition` が効く。drop 確定と同時に自然に fade out する。
+struct DropPlaceholderCard: View {
     let task: TaskCard
     let accent: Color
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Rectangle()
-                    .fill(accent)
-                    .frame(width: 3)
-                    .clipShape(Capsule())
-                Text(task.title)
-                    .font(.system(.body, weight: .medium))
-                    .lineLimit(2)
-            }
-            if !task.body.isEmpty {
-                Text(task.body)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-            }
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Rectangle()
+                .fill(accent)
+                .frame(width: 3)
+                .clipShape(Capsule())
+            Text(task.title)
+                .font(.system(.body, weight: .medium))
+                .lineLimit(2)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 0)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .background(accent.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(accent.opacity(0.5), lineWidth: 2)
+                .strokeBorder(accent.opacity(0.55),
+                              style: StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
         )
-        .shadow(color: .black.opacity(0.25), radius: 14, y: 6)
-        .rotationEffect(.degrees(-2))
+        .opacity(0.8)
     }
 }
