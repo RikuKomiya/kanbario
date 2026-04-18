@@ -311,6 +311,169 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
 
     override var acceptsFirstResponder: Bool { true }
 
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok, let surface = runtimeSurface {
+            ghostty_surface_set_focus(surface, true)
+        }
+        return ok
+    }
+
+    override func resignFirstResponder() -> Bool {
+        if let surface = runtimeSurface {
+            ghostty_surface_set_focus(surface, false)
+        }
+        return super.resignFirstResponder()
+    }
+
+    // MARK: - Key input (D-c.2b — minimal direct path, IME comes in 2c)
+
+    // Placeholder matching NSTextInputClient.hasMarkedText(); the real method
+    // lands with the NSTextInputClient extension in D-c.2c and will shadow this.
+    private var hasMarkedInput: Bool { false }
+
+    override func keyDown(with event: NSEvent) {
+        guard let surface = runtimeSurface else {
+            super.keyDown(with: event)
+            return
+        }
+
+        // Ctrl-modified terminal input (for example Ctrl+D): send a deterministic
+        // Ghostty key event without AppKit text interpretation. cmux §6699-6762.
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.control),
+           !flags.contains(.command),
+           !flags.contains(.option),
+           !hasMarkedInput {
+            ghostty_surface_set_focus(surface, true)
+            if sendBasicKey(surface: surface, event: event, useIgnoringModifiers: true) {
+                return
+            }
+        }
+
+        // Non-IME default path. MVP forwards key events directly to libghostty;
+        // interpretKeyEvents / preedit plumbing lands in D-c.2c with the
+        // NSTextInputClient extension.
+        _ = sendBasicKey(surface: surface, event: event, useIgnoringModifiers: false)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        guard let surface = runtimeSurface else {
+            super.flagsChanged(with: event)
+            return
+        }
+
+        if !hasMarkedInput,
+           let action = kanbarioGhosttyModifierActionForFlagsChanged(
+            keyCode: event.keyCode,
+            modifierFlagsRawValue: event.modifierFlags.rawValue
+           ) {
+            // Modifier-only events carry no text; avoid unshiftedCodepointFromEvent
+            // which probes AppKit character APIs that aren't safe for modifier-only
+            // events. cmux §7105-7130.
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.action = action
+            keyEvent.keycode = UInt32(event.keyCode)
+            keyEvent.mods = modsFromEvent(event)
+            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+            keyEvent.text = nil
+            keyEvent.composing = false
+            keyEvent.unshifted_codepoint = 0
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+    }
+
+    @discardableResult
+    private func sendBasicKey(
+        surface: ghostty_surface_t,
+        event: NSEvent,
+        useIgnoringModifiers: Bool
+    ) -> Bool {
+        var keyEvent = ghostty_input_key_s()
+        keyEvent.action = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
+        keyEvent.keycode = UInt32(event.keyCode)
+        keyEvent.mods = modsFromEvent(event)
+        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+        keyEvent.composing = false
+        keyEvent.unshifted_codepoint = unshiftedCodepointFromEvent(event)
+
+        let text: String
+        if useIgnoringModifiers {
+            text = event.charactersIgnoringModifiers ?? event.characters ?? ""
+        } else {
+            text = textForKeyEvent(event) ?? ""
+        }
+
+        if text.isEmpty {
+            keyEvent.text = nil
+            return ghostty_surface_key(surface, keyEvent)
+        }
+        return text.withCString { ptr in
+            keyEvent.text = ptr
+            return ghostty_surface_key(surface, keyEvent)
+        }
+    }
+
+    // MARK: - Mods (cmux §7194-7217)
+
+    private func modsFromEvent(_ event: NSEvent) -> ghostty_input_mods_e {
+        modsFromFlags(event.modifierFlags)
+    }
+
+    private func modsFromFlags(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
+        var mods = GHOSTTY_MODS_NONE.rawValue
+        if flags.contains(.shift) { mods |= GHOSTTY_MODS_SHIFT.rawValue }
+        if flags.contains(.control) { mods |= GHOSTTY_MODS_CTRL.rawValue }
+        if flags.contains(.option) { mods |= GHOSTTY_MODS_ALT.rawValue }
+        if flags.contains(.command) { mods |= GHOSTTY_MODS_SUPER.rawValue }
+        return ghostty_input_mods_e(rawValue: mods)
+    }
+
+    // MARK: - Text extraction helpers (cmux §7237-7291)
+
+    /// Extract the characters for a key event with control-character handling.
+    /// When control is pressed we get the character without the control modifier
+    /// so Ghostty's KeyEncoder can apply its own control encoding.
+    private func textForKeyEvent(_ event: NSEvent) -> String? {
+        guard let chars = event.characters, !chars.isEmpty else { return nil }
+
+        if chars.count == 1, let scalar = chars.unicodeScalars.first {
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+
+            if isControlCharacterScalar(scalar) {
+                if flags.contains(.control) {
+                    return event.characters(byApplyingModifiers: event.modifierFlags.subtracting(.control))
+                }
+                // AppKit sometimes reports Shift+` as a bare ESC even though the
+                // physical key should produce "~".
+                if scalar.value == 0x1B,
+                   flags == [.shift],
+                   event.charactersIgnoringModifiers == "`" {
+                    return "~"
+                }
+            }
+            // Private-use codepoints (function keys) must not be sent as text.
+            if scalar.value >= 0xF700 && scalar.value <= 0xF8FF {
+                return nil
+            }
+        }
+
+        return chars
+    }
+
+    /// Fallback unshifted codepoint. cmux uses a KeyboardLayout helper that
+    /// consults the Core Foundation layout cache; kanbario's MVP relies on
+    /// AppKit's byApplyingModifiers:[] alone, which covers US / ISO layouts.
+    private func unshiftedCodepointFromEvent(_ event: NSEvent) -> UInt32 {
+        guard let chars = (event.characters(byApplyingModifiers: []) ?? event.charactersIgnoringModifiers ?? event.characters),
+              let scalar = chars.unicodeScalars.first else { return 0 }
+        return scalar.value
+    }
+
+    private func isControlCharacterScalar(_ scalar: UnicodeScalar) -> Bool {
+        scalar.value < 0x20 || scalar.value == 0x7F
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
