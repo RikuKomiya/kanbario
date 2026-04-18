@@ -60,6 +60,109 @@ actor SessionManager {
 
     // MARK: - API
 
+    /// claude 本体を PTY 経由で spawn する。MVP 時点では hook 注入は行わず、
+    /// プロセス exit を SessionManager.readLoop の終端で検知して UI 側の状態遷移
+    /// (inProgress → review) を駆動する。
+    ///
+    /// - Parameters:
+    ///   - task: 対応する TaskCard。初回プロンプトは task.body をそのまま渡す
+    ///   - worktreeURL: wt が作った worktree のルート (claude の cwd)
+    ///   - claudeExecutable: nil の場合 PATH から探す (典型: /opt/homebrew/bin/claude)
+    /// - Throws: claude が見つからない場合 .spawnFailed
+    func startClaude(task: TaskCard, worktreeURL: URL,
+                     claudeExecutable: URL? = nil) async throws -> LiveSession {
+        let executable: URL
+        if let explicit = claudeExecutable {
+            executable = explicit
+        } else if let found = Self.locateExecutable("claude") {
+            executable = found
+        } else {
+            throw Error.spawnFailed(
+                underlying: NSError(domain: "kanbario.SessionManager", code: 127,
+                                    userInfo: [NSLocalizedDescriptionKey:
+                                        "claude binary not found in PATH. `brew install claude` or set explicit path."])
+            )
+        }
+
+        // Commit 2 で Unix socket の path や HOOK_CLI を足す予定。いまは
+        // KANBARIO_SURFACE_ID だけ仕込んでおき、将来 shim 経由になったときに
+        // 「kanbario の中で動いている」判定が機能するよう布石を打っておく。
+        var env = ProcessInfo.processInfo.environment
+        env["KANBARIO_SURFACE_ID"] = task.id.uuidString
+        env["KANBARIO_TASK_ID"] = task.id.uuidString
+        env["TERM"] = env["TERM"] ?? "xterm-256color"
+        // GUI (Xcode/Finder) 起動のアプリは launchd の細い PATH を継承するため、
+        // ユーザの .zshrc で足された Homebrew / node 系のパスが効かない。
+        // claude 側の stop hook (node 実行) や MCP クライアントがコケるので、
+        // 典型的な user-local bin を前置しておく。
+        env["PATH"] = Self.augmentedPATH(current: env["PATH"])
+
+        return try await start(
+            executable: executable,
+            arguments: [task.body],
+            cwd: worktreeURL,
+            environment: env
+        )
+    }
+
+    /// 子プロセスに渡す PATH を補う。launchd 継承の貧弱な PATH の手前に
+    /// user-local bin を挿す。既に同じパスがあれば重複させない。
+    ///
+    /// 候補は「Mac 開発機でよく登場する dev toolchain の bin 位置」:
+    ///   - ~/.local/bin, ~/.volta/bin, ~/.cargo/bin, ~/.bun/bin, ~/.deno/bin
+    ///   - /opt/homebrew/{bin,sbin} (Apple Silicon Homebrew)
+    ///   - /usr/local/{bin,sbin} (Intel Homebrew / 手動インストール)
+    ///
+    /// これでも足りないユーザー (asdf / mise 等) は Settings で PATH 指定できる
+    /// ようにするのが将来の拡張。MVP では hardcode で 9 割のケースを拾う。
+    static func augmentedPATH(current: String?) -> String {
+        let home = NSHomeDirectory()
+        let additions = [
+            "\(home)/.local/bin",
+            "\(home)/.volta/bin",
+            "\(home)/.cargo/bin",
+            "\(home)/.bun/bin",
+            "\(home)/.deno/bin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+        ]
+        let existing = (current ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for p in additions + existing where !p.isEmpty {
+            if seen.insert(p).inserted { ordered.append(p) }
+        }
+        return ordered.joined(separator: ":")
+    }
+
+    /// PATH から実行可能ファイルを探す。Xcode ランナーの PATH は絞られているので
+    /// WorktreeService と同じく Homebrew の典型パスを fallback として見に行く。
+    private static func locateExecutable(_ name: String) -> URL? {
+        let envPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map(String.init)
+        let fallbacks = ["/opt/homebrew/bin", "/usr/local/bin",
+                         "/Users/\(NSUserName())/.local/bin"]
+        var seen = Set<String>()
+        for dir in envPaths + fallbacks where seen.insert(dir).inserted {
+            let candidate = URL(fileURLWithPath: dir).appendingPathComponent(name)
+            if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// セッションの子プロセスを SIGTERM (fallback SIGKILL) で終了させる。
+    /// done 時 cleanup で使う。既に死んでいる場合は no-op。
+    func kill(id: SessionID) {
+        guard let process = processes[id] else { return }
+        if process.isRunning {
+            process.terminate()
+        }
+    }
+
     /// コマンドを PTY 経由で起動する。
     func start(executable: URL, arguments: [String] = [], cwd: URL? = nil,
                environment: [String: String]? = nil,
