@@ -21,8 +21,14 @@ Package.resolved
 # macOS
 .DS_Store
 
-# libghostty vendored artifacts
+# libghostty / GhosttyKit artifacts (produced by scripts/ensure-ghosttykit.sh)
 vendor/libghostty/
+/GhosttyKit.xcframework
+# Build intermediates inside the ghostty submodule (do not let zig-cache /
+# macos/GhosttyKit.xcframework leak as untracked files in git status)
+ghostty/zig-cache/
+ghostty/zig-out/
+ghostty/macos/GhosttyKit.xcframework/
 
 # App runtime data (never commit user data)
 *.app/Contents/Resources/bin/claude.real
