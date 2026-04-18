@@ -8,43 +8,68 @@ struct NewTaskSheet: View {
     @State private var title: String = ""
     @State private var bodyText: String = ""   // `body` は View の property と衝突するので rename
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("New Task")
-                .font(.title2).bold()
+    @FocusState private var focus: Field?
+    enum Field { case title, body }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Title").font(.caption).foregroundStyle(.secondary)
-                TextField("1 行要約 (例: Fix login bug)", text: $title)
-                    .textFieldStyle(.roundedBorder)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label("New Task", systemImage: "plus.square.fill.on.square.fill")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.primary)
+                Spacer()
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Task body (Claude への初回プロンプト)")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("Title")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                TextField("1 行要約 (例: Fix login bug)", text: $title)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($focus, equals: .title)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Claude prompt")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
                 TextEditor(text: $bodyText)
                     .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: 120)
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .background(Color(.textBackgroundColor))
+                    .frame(minHeight: 140)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 4)
-                            .stroke(Color.secondary.opacity(0.3))
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(focus == .body ? Color.accentColor.opacity(0.5) : Color.black.opacity(0.12),
+                                    lineWidth: focus == .body ? 2 : 1)
                     )
+                    .focused($focus, equals: .body)
+                    .animation(.smooth(duration: 0.15), value: focus)
             }
 
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
+                    .controlSize(.large)
                 Button("Save") {
-                    appState.addTask(title: title, body: bodyText)
+                    withAnimation(.smooth(duration: 0.3)) {
+                        appState.addTask(title: title, body: bodyText)
+                    }
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
                 .disabled(!isValid)
             }
         }
-        .padding(20)
-        .frame(minWidth: 480, minHeight: 300)
+        .padding(22)
+        .frame(minWidth: 520, minHeight: 340)
+        .background(Color(.windowBackgroundColor))
+        .onAppear { focus = .title }
     }
 
     /// Save ボタンを有効化する条件。

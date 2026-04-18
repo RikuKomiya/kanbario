@@ -26,3 +26,4 @@ vendor/libghostty/
 
 # App runtime data (never commit user data)
 *.app/Contents/Resources/bin/claude.real
+*.profraw

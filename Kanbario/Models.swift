@@ -1,6 +1,5 @@
 import Foundation
 import CoreTransferable
-import UniformTypeIdentifiers
 
 // MARK: - TaskCard
 
@@ -65,15 +64,18 @@ struct Project: Identifiable, Codable, Hashable {
 
 /// Drag-and-drop のペイロード。TaskCard 全体を運ぶと大きすぎるので ID だけ。
 /// drop 先で AppState から本体を引き直す。
-struct TaskDrag: Codable, Transferable {
+///
+/// 実装メモ: 最初は独自 UTType `app.kanbario.task-drag` + CodableRepresentation で書いたが、
+/// カスタム UTType は Info.plist の UTExportedTypeDeclarations に登録しないと pasteboard
+/// が認識せず、同一プロセス内ドロップでも silent fail する。Info.plist いじりを避けるため、
+/// String (標準 Transferable) 経由の ProxyRepresentation に切り替えた。
+struct TaskDrag: Transferable {
     let id: UUID
 
     static var transferRepresentation: some TransferRepresentation {
-        CodableRepresentation(contentType: .taskDrag)
+        ProxyRepresentation(
+            exporting: { (drag: TaskDrag) in drag.id.uuidString },
+            importing: { (s: String) in TaskDrag(id: UUID(uuidString: s) ?? UUID()) }
+        )
     }
-}
-
-extension UTType {
-    /// kanbario 固有の UTI。macOS 上で他のアプリとドラッグを衝突させないため。
-    static let taskDrag = UTType(exportedAs: "app.kanbario.task-drag")
 }

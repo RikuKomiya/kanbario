@@ -6,85 +6,140 @@ struct TaskDetailView: View {
     @Environment(AppState.self) private var appState
 
     var body: some View {
-        if let task = appState.selectedTask {
-            detail(for: task)
-        } else {
-            placeholder
+        Group {
+            if let task = appState.selectedTask {
+                detail(for: task)
+                    .transition(.asymmetric(
+                        insertion: .opacity,
+                        removal: .opacity
+                    ))
+            } else {
+                placeholder
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.windowBackgroundColor))
+        .animation(.smooth(duration: 0.25), value: appState.selectedTaskID)
     }
 
     private func detail(for task: TaskCard) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // ヘッダ
-            HStack {
-                statusBadge(task.status)
-                Spacer()
-                Button(role: .destructive) {
-                    appState.deleteTask(id: task.id)
-                } label: {
-                    Image(systemName: "trash")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // ヘッダ
+                HStack {
+                    statusBadge(task.status)
+                    Spacer()
+                    Button(role: .destructive) {
+                        withAnimation(.smooth(duration: 0.25)) {
+                            appState.deleteTask(id: task.id)
+                        }
+                    } label: {
+                        Image(systemName: "trash")
+                            .foregroundStyle(.red.opacity(0.85))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Delete task")
                 }
-                .buttonStyle(.plain)
-                .help("Delete task")
+
+                Text(task.title)
+                    .font(.system(.title2, weight: .semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // メタデータ
+                VStack(alignment: .leading, spacing: 6) {
+                    LabeledRow(
+                        icon: "arrow.triangle.branch",
+                        label: "Branch",
+                        value: task.branch,
+                        monospaced: true
+                    )
+                    LabeledRow(
+                        icon: "calendar",
+                        label: "Created",
+                        value: task.createdAt.formatted(date: .abbreviated, time: .shortened)
+                    )
+                    LabeledRow(
+                        icon: "clock",
+                        label: "Updated",
+                        value: task.updatedAt.formatted(date: .abbreviated, time: .shortened)
+                    )
+                }
+                .padding(10)
+                .background(Color(.controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                // Body
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "text.alignleft")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("Claude prompt")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(task.body)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(10)
+                        .background(Color(.textBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.black.opacity(0.08))
+                        )
+                }
+
+                // Milestone C 予定のアクション
+                HStack {
+                    Button {
+                        // TODO: Phase C
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "play.fill")
+                            Text("Start")
+                        }
+                        .frame(minWidth: 80)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(task.status != .planning)
+                    .help(task.status == .planning ? "Start Claude (Milestone C)" : "Only planning tasks can be started")
+
+                    Spacer()
+                }
+                .padding(.top, 4)
             }
-
-            Text(task.title)
-                .font(.title2).bold()
-
-            // メタデータ
-            VStack(alignment: .leading, spacing: 4) {
-                LabeledRow(label: "Branch", value: task.branch)
-                LabeledRow(label: "Created", value: task.createdAt.formatted(date: .abbreviated, time: .shortened))
-                LabeledRow(label: "Updated", value: task.updatedAt.formatted(date: .abbreviated, time: .shortened))
-            }
-
-            Divider()
-
-            // Body (task 内容 = Claude への初回プロンプト)
-            Text("Body (Claude prompt)")
-                .font(.caption).foregroundStyle(.secondary)
-            ScrollView {
-                Text(task.body)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding(8)
-                    .background(Color(.textBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-            }
-
-            Spacer()
-
-            // Milestone C 予定のアクション枠 (現状は placeholder)
-            HStack {
-                Button("Start (Milestone C)") { /* TODO: Phase C */ }
-                    .disabled(true)
-                Spacer()
-            }
-            .padding(.top, 8)
+            .padding(18)
         }
-        .padding(16)
     }
 
     private var placeholder: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 10) {
             Image(systemName: "square.on.square.dashed")
-                .font(.system(size: 40))
+                .font(.system(size: 36))
                 .foregroundStyle(.tertiary)
             Text("Select a task to see details")
+                .font(.callout)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func statusBadge(_ status: TaskStatus) -> some View {
-        Text(status.displayName)
-            .font(.caption).bold()
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(badgeColor(status).opacity(0.2))
-            .foregroundStyle(badgeColor(status))
-            .clipShape(Capsule())
+        HStack(spacing: 5) {
+            Circle()
+                .fill(badgeColor(status))
+                .frame(width: 7, height: 7)
+            Text(status.displayName)
+                .font(.system(.caption, weight: .semibold))
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(badgeColor(status).opacity(0.15))
+        .foregroundStyle(badgeColor(status))
+        .clipShape(Capsule())
     }
 
     private func badgeColor(_ status: TaskStatus) -> Color {
@@ -98,16 +153,23 @@ struct TaskDetailView: View {
 }
 
 private struct LabeledRow: View {
+    let icon: String
     let label: String
     let value: String
+    var monospaced: Bool = false
+
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 14)
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 72, alignment: .trailing)
+                .frame(width: 60, alignment: .leading)
             Text(value)
-                .font(.caption)
+                .font(monospaced ? .system(.caption, design: .monospaced) : .caption)
                 .textSelection(.enabled)
             Spacer()
         }

@@ -16,5 +16,8 @@ struct KanbarioApp: App {
             ContentView()
                 .environment(appState)
         }
+        // `.hiddenTitleBar` は一部 macOS で HSplitView とレイアウトが崩れるので、
+        // 通常のタイトルバー + unified toolbar style を使う。
+        .windowToolbarStyle(.unified)
     }
 }
