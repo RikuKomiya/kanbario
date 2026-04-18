@@ -257,6 +257,15 @@ final class TerminalSurface {
         guard let surface else { return }
         ghostty_surface_refresh(surface)
     }
+
+    /// Gracefully request the child to close. libghostty delivers SIGHUP to the
+    /// PTY, which the shell / claude forwards along. The close_surface_cb fires
+    /// once the child has wound down; callers should treat this as a hint rather
+    /// than a synchronous termination.
+    func requestClose() {
+        guard let surface else { return }
+        ghostty_surface_request_close(surface)
+    }
 }
 
 // MARK: - NSView subclass

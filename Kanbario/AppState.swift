@@ -24,26 +24,13 @@ final class AppState {
     /// UI に表示するエラー (alert の source of truth)。
     var lastError: String?
 
-    /// 現在 live な claude セッション: taskID -> SessionManager.SessionID。
-    /// done 時の cleanup 対象を引くのに使う。
-    var activeSessions: [UUID: SessionManager.SessionID] = [:]
-
-    /// Claude の stdout を積むバッファ。taskID -> tail (最大 `maxLogBytes` 文字)。
-    /// ANSI escape は粗く剥がして可読テキストに寄せる (perfect な TUI 再描画は
-    /// libghostty 導入後に任せる。いまは「何が起きているか」を確認できれば十分)。
-    var sessionLogs: [UUID: String] = [:]
-
-    /// セッション終了時の exit code。review 状態の下に表示する。
-    var sessionExitCodes: [UUID: Int32] = [:]
-
-    /// 1 セッションあたりのログ tail 上限。これを超えたら先頭を捨てる。
-    private static let maxLogBytes = 8 * 1024
+    /// 現在 live な claude セッション: taskID -> TerminalSurface (libghostty が
+    /// PTY と子プロセスを所有する。Milestone D 以降はここで保持するだけで、
+    /// stdout の吸い出し・ログ蓄積はやらない — libghostty が GPU に描画する)。
+    var activeSurfaces: [UUID: TerminalSurface] = [:]
 
     /// デモ用のデフォルトプロジェクト。MVP は 1 プロジェクト前提。
     let defaultProject: Project
-
-    /// worktree と claude spawn を担う背後アクター。MainActor からは await 越しに呼ぶ。
-    let sessionManager = SessionManager()
 
     /// repoPath が設定されるまでは nil。設定時に init (throws)、失敗時は lastError を立てる。
     private(set) var worktreeService: WorktreeService?
@@ -164,119 +151,55 @@ final class AppState {
 
     // MARK: - Claude lifecycle
 
-    /// Start ボタンから呼ばれる。wt create → claude spawn → inProgress へ同期遷移 →
-    /// termination を watch して完了時に review へ移す。失敗時は lastError を立てる。
+    /// Start ボタンから呼ばれる。wt create → TerminalSurface (libghostty 側で
+    /// fork+execve) → inProgress へ同期遷移。プロセス exit は
+    /// `handleSurfaceClosed` (close_surface_cb からの callback) で review に
+    /// 飛ばす。
     func startTask(_ task: TaskCard) async {
         guard let wt = worktreeService else {
             lastError = "リポジトリを選んでください (Choose Repo…)"
             return
         }
         guard task.status == .planning else { return }
-        guard activeSessions[task.id] == nil else { return }
+        guard activeSurfaces[task.id] == nil else { return }
 
         do {
             let worktreeURL = try await wt.create(branch: task.branch)
-            let session = try await sessionManager.startClaude(
+            let surface = try ClaudeSessionFactory.makeSurface(
                 task: task, worktreeURL: worktreeURL
             )
-            activeSessions[task.id] = session.id
-            sessionLogs[task.id] = ""
-            sessionExitCodes.removeValue(forKey: task.id)
+            activeSurfaces[task.id] = surface
             applyStatus(id: task.id, to: .inProgress)
-
-            let taskID = task.id
-
-            // PTY stdout を吸い出して sessionLogs[taskID] に追記する。ANSI を
-            // 剥がして読める形にする (libghostty 導入まではこれで凌ぐ)。
-            _Concurrency.Task { @MainActor [weak self] in
-                for await chunk in session.bytes {
-                    self?.appendLog(taskID: taskID, data: chunk)
-                }
-            }
-
-            // PTY 終端を監視して自動で review に飛ばす。
-            // Session は actor 越しの class なので capture に weak は不要 (session 自身は
-            // SessionManager が保持)。終了後に activeSessions から drop。
-            _Concurrency.Task { @MainActor [weak self] in
-                for await exitCode in session.termination {
-                    guard let self else { return }
-                    self.sessionExitCodes[taskID] = exitCode
-                    self.activeSessions.removeValue(forKey: taskID)
-                    self.applyStatus(id: taskID, to: .review)
-                }
-            }
         } catch {
             lastError = "Start failed: \(error)"
         }
     }
 
-    /// 手動で claude を止める。SIGTERM 送信 → PTY EOF → termination watcher
-    /// 経由で review に遷移する。
-    func stopTask(id: UUID) async {
-        guard let sessionID = activeSessions[id] else { return }
-        await sessionManager.kill(id: sessionID)
+    /// 手動で claude を止める。libghostty に gracefully close を依頼すると、
+    /// 子プロセス (claude) に SIGHUP が届き、その後 close_surface_cb が発火。
+    /// handleSurfaceClosed で review に遷移する。
+    func stopTask(id: UUID) {
+        activeSurfaces[id]?.requestClose()
     }
 
-    /// 標準入力に文字列を流す (末尾に \n を足す)。
-    /// 返り値は成功/失敗の情報を出すためだが、UI はいまは気にしない。
-    func sendInput(taskID: UUID, text: String) async {
-        guard let sessionID = activeSessions[taskID] else { return }
-        let bytes = (text + "\n").data(using: .utf8) ?? Data()
-        do {
-            try await sessionManager.write(to: sessionID, bytes: bytes)
-        } catch {
-            lastError = "入力送信失敗: \(error)"
-        }
+    /// `GhosttyNSView.onCloseRequested` 経由で呼ばれる。libghostty が子プロセス
+    /// 終了を検知したタイミングで review に飛ばす。
+    func handleSurfaceClosed(taskID: UUID) {
+        guard activeSurfaces[taskID] != nil else { return }
+        activeSurfaces.removeValue(forKey: taskID)
+        applyStatus(id: taskID, to: .review)
     }
 
-    /// PTY から届いたバイトを String に落として ANSI を粗く剥がしてから追記する。
-    /// tail 上限を超えたら先頭を捨てる (log が無限増殖しないように)。
-    private func appendLog(taskID: UUID, data: Data) {
-        guard let text = String(data: data, encoding: .utf8) else { return }
-        let cleaned = Self.stripANSI(text)
-        var current = sessionLogs[taskID, default: ""]
-        current += cleaned
-        if current.count > Self.maxLogBytes {
-            current = String(current.suffix(Self.maxLogBytes))
-        }
-        sessionLogs[taskID] = current
-    }
-
-    /// ANSI CSI シーケンス (`ESC[...letter`) と単発制御文字を剥がす。
-    /// 完全な VT 解釈ではないが、claude TUI の出力から可読テキストを拾うには十分。
-    static func stripANSI(_ s: String) -> String {
-        // CSI (cursor pos、色など) を削除
-        var out = s.replacingOccurrences(
-            of: "\u{001B}\\[[0-9;?]*[A-Za-z]",
-            with: "",
-            options: .regularExpression
-        )
-        // OSC (タイトル設定等) を BEL / ESC\ まで削除
-        out = out.replacingOccurrences(
-            of: "\u{001B}\\][^\u{0007}\u{001B}]*(\u{0007}|\u{001B}\\\\)",
-            with: "",
-            options: .regularExpression
-        )
-        // 残った単発 ESC + 次の 1 文字を削除 (=, >, M, 7, 8 等)
-        out = out.replacingOccurrences(
-            of: "\u{001B}.",
-            with: "",
-            options: .regularExpression
-        )
-        // キャリッジリターンは改行に寄せる (スクロール表示を楽にするため)
-        out = out.replacingOccurrences(of: "\r\n", with: "\n")
-        out = out.replacingOccurrences(of: "\r", with: "\n")
-        return out
-    }
-
-    /// review → done drag で呼ばれる。claude kill → wt remove → done へ遷移。
+    /// review → done drag で呼ばれる。surface teardown → wt remove → done へ遷移。
     /// wt remove が失敗しても done 状態までは進める (worktree は手動削除できる)。
     func moveToDone(task: TaskCard) async {
         guard task.status == .review else { return }
 
-        if let sessionID = activeSessions[task.id] {
-            await sessionManager.kill(id: sessionID)
-            activeSessions.removeValue(forKey: task.id)
+        if let surface = activeSurfaces[task.id] {
+            await MainActor.run {
+                surface.teardown()
+            }
+            activeSurfaces.removeValue(forKey: task.id)
         }
 
         if let wt = worktreeService {
