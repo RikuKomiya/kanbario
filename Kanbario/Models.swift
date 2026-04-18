@@ -1,4 +1,6 @@
 import Foundation
+import CoreTransferable
+import UniformTypeIdentifiers
 
 // MARK: - TaskCard
 
@@ -57,4 +59,21 @@ struct Project: Identifiable, Codable, Hashable {
     var repoPath: String
     var defaultBranch: String
     var createdAt: Date
+}
+
+// MARK: - Drag payload
+
+/// Drag-and-drop のペイロード。TaskCard 全体を運ぶと大きすぎるので ID だけ。
+/// drop 先で AppState から本体を引き直す。
+struct TaskDrag: Codable, Transferable {
+    let id: UUID
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: .taskDrag)
+    }
+}
+
+extension UTType {
+    /// kanbario 固有の UTI。macOS 上で他のアプリとドラッグを衝突させないため。
+    static let taskDrag = UTType(exportedAs: "app.kanbario.task-drag")
 }
