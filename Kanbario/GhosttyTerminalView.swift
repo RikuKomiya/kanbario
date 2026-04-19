@@ -516,6 +516,108 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
         return ghostty_input_mods_e(rawValue: mods)
     }
 
+    // MARK: - Mouse / scroll (D-c.2d)
+
+    override func mouseDown(with event: NSEvent) {
+        // Clicks should always take first responder so keyboard input routes
+        // here even if the user tabbed around SwiftUI elements.
+        window?.makeFirstResponder(self)
+
+        guard let surface = runtimeSurface else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        // Only update position on first click so double-click selection isn't
+        // jittered by a second mouse_pos at a slightly different point (cmux §7461).
+        if event.clickCount == 1 {
+            ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
+        }
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, modsFromEvent(event))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let surface = runtimeSurface else { return }
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, modsFromEvent(event))
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let surface = runtimeSurface else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard let surface = runtimeSurface else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT, modsFromEvent(event))
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard let surface = runtimeSurface else {
+            super.rightMouseUp(with: event)
+            return
+        }
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT, modsFromEvent(event))
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        guard let surface = runtimeSurface else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        ghostty_surface_mouse_pos(surface, point.x, bounds.height - point.y, modsFromEvent(event))
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_MIDDLE, modsFromEvent(event))
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard let surface = runtimeSurface else { return }
+        _ = ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_MIDDLE, modsFromEvent(event))
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let surface = runtimeSurface else { return }
+        var x = event.scrollingDeltaX
+        var y = event.scrollingDeltaY
+        let precision = event.hasPreciseScrollingDeltas
+        if precision {
+            x *= 2
+            y *= 2
+        }
+
+        // ghostty_input_scroll_mods_t packs: bit 0 = precision, bits 1..n = momentum.
+        // cmux §8312-8334.
+        var mods: Int32 = 0
+        if precision {
+            mods |= 0b0000_0001
+        }
+
+        let momentum: Int32
+        switch event.momentumPhase {
+        case .began:
+            momentum = Int32(GHOSTTY_MOUSE_MOMENTUM_BEGAN.rawValue)
+        case .stationary:
+            momentum = Int32(GHOSTTY_MOUSE_MOMENTUM_STATIONARY.rawValue)
+        case .changed:
+            momentum = Int32(GHOSTTY_MOUSE_MOMENTUM_CHANGED.rawValue)
+        case .ended:
+            momentum = Int32(GHOSTTY_MOUSE_MOMENTUM_ENDED.rawValue)
+        case .cancelled:
+            momentum = Int32(GHOSTTY_MOUSE_MOMENTUM_CANCELLED.rawValue)
+        case .mayBegin:
+            momentum = Int32(GHOSTTY_MOUSE_MOMENTUM_MAY_BEGIN.rawValue)
+        default:
+            momentum = Int32(GHOSTTY_MOUSE_MOMENTUM_NONE.rawValue)
+        }
+        mods |= momentum << 1
+
+        ghostty_surface_mouse_scroll(
+            surface,
+            x,
+            y,
+            ghostty_input_scroll_mods_t(mods)
+        )
+    }
+
     // MARK: - Text extraction helpers (cmux §7237-7291)
 
     /// Extract the characters for a key event with control-character handling.
