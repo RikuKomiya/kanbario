@@ -285,6 +285,28 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
     /// plumbing lives in `SessionManager` (see D-c step 3).
     var onCloseRequested: ((_ needsConfirm: Bool) -> Void)?
 
+    // MARK: - IME state (D-c.2c)
+    //
+    // AppKit's text input system (NSTextInputClient) drives IME by asking us to
+    // hold marked text during composition and swap it for committed text on
+    // confirmation. Everything below mirrors cmux's layout — see the
+    // NSTextInputClient extension at the bottom of this file.
+
+    /// Current IME preedit (composition) text. Empty when nothing is being
+    /// composed. `hasMarkedText()` checks this length.
+    fileprivate var markedText = NSMutableAttributedString()
+
+    /// Populated by `insertText` during a `keyDown` → `interpretKeyEvents`
+    /// cycle, consumed at the end of `keyDown`. When nil we're outside a
+    /// keyDown event (e.g. AX / dictation) and should send text directly.
+    fileprivate var keyTextAccumulator: [String]?
+
+    /// Glyph cell size reported by libghostty, used for IME candidate window
+    /// positioning. cmux pipes this from a Ghostty action_cb notification —
+    /// kanbario's MVP stub leaves it at .zero (firstRect uses a sensible
+    /// fallback) and revisits once we wire action_cb notifications.
+    fileprivate var cellSize: CGSize = .zero
+
     init(terminalSurface: TerminalSurface) {
         self.surfaceId = terminalSurface.id
         self.terminalSurface = terminalSurface
@@ -335,11 +357,7 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
         return super.resignFirstResponder()
     }
 
-    // MARK: - Key input (D-c.2b — minimal direct path, IME comes in 2c)
-
-    // Placeholder matching NSTextInputClient.hasMarkedText(); the real method
-    // lands with the NSTextInputClient extension in D-c.2c and will shadow this.
-    private var hasMarkedInput: Bool { false }
+    // MARK: - Key input (D-c.2b + 2c IME integration)
 
     override func keyDown(with event: NSEvent) {
         guard let surface = runtimeSurface else {
@@ -349,21 +367,71 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
 
         // Ctrl-modified terminal input (for example Ctrl+D): send a deterministic
         // Ghostty key event without AppKit text interpretation. cmux §6699-6762.
+        // This bypass is only safe when no IME composition is active, since
+        // interpretKeyEvents is the only way to let the IME react.
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if flags.contains(.control),
            !flags.contains(.command),
            !flags.contains(.option),
-           !hasMarkedInput {
+           !hasMarkedText() {
             ghostty_surface_set_focus(surface, true)
             if sendBasicKey(surface: surface, event: event, useIgnoringModifiers: true) {
                 return
             }
         }
 
-        // Non-IME default path. MVP forwards key events directly to libghostty;
-        // interpretKeyEvents / preedit plumbing lands in D-c.2c with the
-        // NSTextInputClient extension.
-        _ = sendBasicKey(surface: surface, event: event, useIgnoringModifiers: false)
+        // IME / text-composition path (cmux §6764-7100 condensed). The trick is:
+        //   1. Set keyTextAccumulator so insertText can append into it.
+        //   2. Let AppKit's interpretKeyEvents deliver the key to the active
+        //      input method. IME composition calls setMarkedText (no text);
+        //      confirmation calls insertText (fills accumulator).
+        //   3. Sync preedit back to libghostty so Ghostty can render the
+        //      composition overlay on top of the cell grid.
+        //   4. If accumulated text is present, send it as a single key event
+        //      with the text payload. If we're still mid-composition (marked
+        //      text non-empty), don't send a raw key event.
+
+        let markedTextBefore = markedText.length > 0
+
+        keyTextAccumulator = []
+        defer { keyTextAccumulator = nil }
+
+        interpretKeyEvents([event])
+
+        syncPreedit(clearIfNeeded: markedTextBefore)
+
+        let accumulated = (keyTextAccumulator ?? []).joined()
+        if !accumulated.isEmpty {
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.action = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
+            keyEvent.keycode = UInt32(event.keyCode)
+            keyEvent.mods = modsFromEvent(event)
+            keyEvent.consumed_mods = consumedModsFromFlags(event.modifierFlags)
+            keyEvent.composing = false
+            keyEvent.unshifted_codepoint = unshiftedCodepointFromEvent(event)
+            accumulated.withCString { ptr in
+                keyEvent.text = ptr
+                _ = ghostty_surface_key(surface, keyEvent)
+            }
+            return
+        }
+
+        // No text produced and no composition ongoing → send a bare key event
+        // so Ghostty can encode function / arrow keys via its KeyEncoder.
+        if !markedTextBefore && !hasMarkedText() {
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.action = event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS
+            keyEvent.keycode = UInt32(event.keyCode)
+            keyEvent.mods = modsFromEvent(event)
+            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+            keyEvent.composing = false
+            keyEvent.unshifted_codepoint = unshiftedCodepointFromEvent(event)
+            keyEvent.text = nil
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+        // If we're mid-composition (markedText non-empty after interpretKeyEvents)
+        // swallow the raw event — Ghostty gets the preedit overlay via syncPreedit
+        // and the committed text will arrive on the next insertText call.
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -372,7 +440,7 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
             return
         }
 
-        if !hasMarkedInput,
+        if !hasMarkedText(),
            let action = kanbarioGhosttyModifierActionForFlagsChanged(
             keyCode: event.keyCode,
             modifierFlagsRawValue: event.modifierFlags.rawValue
@@ -435,6 +503,16 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
         if flags.contains(.control) { mods |= GHOSTTY_MODS_CTRL.rawValue }
         if flags.contains(.option) { mods |= GHOSTTY_MODS_ALT.rawValue }
         if flags.contains(.command) { mods |= GHOSTTY_MODS_SUPER.rawValue }
+        return ghostty_input_mods_e(rawValue: mods)
+    }
+
+    /// Consumed mods are modifiers that were used for text translation. Control
+    /// and Command never contribute to text translation, so they're excluded.
+    /// cmux §7210-7217.
+    fileprivate func consumedModsFromFlags(_ flags: NSEvent.ModifierFlags) -> ghostty_input_mods_e {
+        var mods = GHOSTTY_MODS_NONE.rawValue
+        if flags.contains(.shift) { mods |= GHOSTTY_MODS_SHIFT.rawValue }
+        if flags.contains(.option) { mods |= GHOSTTY_MODS_ALT.rawValue }
         return ghostty_input_mods_e(rawValue: mods)
     }
 
@@ -536,6 +614,225 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
     func teardown() {
         terminalSurface?.teardown()
         terminalSurface = nil
+    }
+}
+
+// MARK: - NSTextInputClient (D-c.2c — IME / 日本語入力)
+//
+// Layout follows cmux §11739-12189 with kanbario-specific trims:
+// - No DEBUG timing instrumentation
+// - No cmux-specific telemetry (cmuxWriteChildExitProbe, dlog)
+// - No AX / dictation-specific sanitizeExternalCommittedText path
+//   (committed text from insertText goes straight to sendTextToSurface)
+// - readSelectionSnapshot / visibleDocumentRectInScreenCoordinates are stubbed
+//   to defaults since we don't (yet) surface selection / scroll state back to
+//   AppKit. This matters for dictation / accessibility but not for plain IME.
+
+extension GhosttyNSView: NSTextInputClient {
+    /// Deliver committed text to libghostty as a synthetic key event so shells
+    /// keep normal interactive semantics (Return executes, Tab completes, etc.).
+    /// cmux §11744-11827 verbatim minus DEBUG instrumentation.
+    fileprivate func sendTextToSurface(_ chars: String) {
+        guard let surface = runtimeSurface else { return }
+
+        var bufferedText = ""
+        var previousWasCR = false
+
+        func flushBufferedText() {
+            guard !bufferedText.isEmpty else { return }
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.action = GHOSTTY_ACTION_PRESS
+            keyEvent.keycode = 0
+            keyEvent.mods = GHOSTTY_MODS_NONE
+            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+            keyEvent.unshifted_codepoint = 0
+            keyEvent.composing = false
+            bufferedText.withCString { ptr in
+                keyEvent.text = ptr
+                _ = ghostty_surface_key(surface, keyEvent)
+            }
+            bufferedText.removeAll(keepingCapacity: true)
+        }
+
+        func sendControlKey(_ keycode: UInt32) {
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.action = GHOSTTY_ACTION_PRESS
+            keyEvent.keycode = keycode
+            keyEvent.mods = GHOSTTY_MODS_NONE
+            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+            keyEvent.unshifted_codepoint = 0
+            keyEvent.composing = false
+            keyEvent.text = nil
+            _ = ghostty_surface_key(surface, keyEvent)
+        }
+
+        for scalar in chars.unicodeScalars {
+            switch scalar.value {
+            case 0x0A:
+                if !previousWasCR {
+                    flushBufferedText()
+                    sendControlKey(0x24) // kVK_Return
+                }
+                previousWasCR = false
+            case 0x0D:
+                flushBufferedText()
+                sendControlKey(0x24) // kVK_Return
+                previousWasCR = true
+            case 0x09:
+                flushBufferedText()
+                sendControlKey(0x30) // kVK_Tab
+                previousWasCR = false
+            case 0x1B:
+                flushBufferedText()
+                sendControlKey(0x35) // kVK_Escape
+                previousWasCR = false
+            default:
+                bufferedText.unicodeScalars.append(scalar)
+                previousWasCR = false
+            }
+        }
+        flushBufferedText()
+    }
+
+    func hasMarkedText() -> Bool {
+        markedText.length > 0
+    }
+
+    func markedRange() -> NSRange {
+        guard markedText.length > 0 else { return NSRange(location: NSNotFound, length: 0) }
+        return NSRange(location: 0, length: markedText.length)
+    }
+
+    func selectedRange() -> NSRange {
+        NSRange(location: 0, length: 0)
+    }
+
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        switch string {
+        case let v as NSAttributedString:
+            markedText = NSMutableAttributedString(attributedString: v)
+        case let v as String:
+            markedText = NSMutableAttributedString(string: v)
+        default:
+            break
+        }
+        // When called outside a keyDown (e.g. IM selector change while composing)
+        // we push the preedit immediately. Inside keyDown, keyDown's own
+        // syncPreedit call at the end takes care of it.
+        if keyTextAccumulator == nil {
+            syncPreedit()
+        }
+    }
+
+    func unmarkText() {
+        if markedText.length > 0 {
+            markedText.mutableString.setString("")
+            syncPreedit()
+        }
+    }
+
+    /// Push the current `markedText` to libghostty as preedit bytes so it can
+    /// render the IME composition overlay aligned to the cursor cell.
+    /// cmux §12002-12029.
+    fileprivate func syncPreedit(clearIfNeeded: Bool = true) {
+        guard let surface = runtimeSurface else { return }
+
+        if markedText.length > 0 {
+            let str = markedText.string
+            let len = str.utf8CString.count
+            if len > 0 {
+                str.withCString { ptr in
+                    // -1 strips the null terminator; ghostty_surface_preedit
+                    // takes a byte length.
+                    ghostty_surface_preedit(surface, ptr, UInt(len - 1))
+                }
+            }
+        } else if clearIfNeeded {
+            ghostty_surface_preedit(surface, nil, 0)
+        }
+    }
+
+    func validAttributesForMarkedText() -> [NSAttributedString.Key] {
+        []
+    }
+
+    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
+        // kanbario MVP doesn't surface the terminal's selection back to AppKit.
+        // Dictation / AX readers may request substrings; returning nil tells
+        // them to back off, which is correct for our use case (no accessible
+        // selection content yet).
+        _ = range
+        _ = actualRange
+        return nil
+    }
+
+    func characterIndex(for point: NSPoint) -> Int {
+        _ = point
+        return 0
+    }
+
+    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
+        _ = range
+        _ = actualRange
+        guard let window else {
+            return NSRect(x: frame.origin.x, y: frame.origin.y, width: 0, height: 0)
+        }
+
+        // Ask libghostty where the IME cursor should anchor. This positions
+        // Kotoeri / Google IME candidate windows at the terminal cursor.
+        var x: Double = 0
+        var y: Double = 0
+        var w: Double = cellSize.width
+        var h: Double = cellSize.height
+        if let surface = runtimeSurface {
+            ghostty_surface_ime_point(surface, &x, &y, &w, &h)
+        }
+
+        // Ghostty uses top-left origin; AppKit uses bottom-left.
+        let fallbackHeight = h > 0 ? h : 18 // reasonable default line height
+        let viewRect = NSRect(
+            x: x,
+            y: frame.size.height - y,
+            width: w,
+            height: max(h, fallbackHeight)
+        )
+        let windowRect = convert(viewRect, to: nil)
+        return window.convertToScreen(windowRect)
+    }
+
+    func insertText(_ string: Any, replacementRange: NSRange) {
+        _ = replacementRange
+
+        var chars = ""
+        switch string {
+        case let v as NSAttributedString:
+            chars = v.string
+        case let v as String:
+            chars = v
+        default:
+            return
+        }
+
+        // IME confirmation: composition is committed as regular text, so drop
+        // the preedit state first.
+        unmarkText()
+
+        guard !chars.isEmpty else { return }
+
+        // Inside a keyDown, accumulate and let keyDown send one consolidated
+        // key event. Outside (AX / dictation), commit directly.
+        if keyTextAccumulator != nil {
+            keyTextAccumulator?.append(chars)
+            return
+        }
+
+        sendTextToSurface(chars)
+    }
+
+    /// Legacy NSResponder signature (used by some AX paths). Routes through the
+    /// modern `insertText(_:replacementRange:)` so we have one code path.
+    override func insertText(_ insertString: Any) {
+        insertText(insertString, replacementRange: NSRange(location: NSNotFound, length: 0))
     }
 }
 
