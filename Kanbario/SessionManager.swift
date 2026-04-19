@@ -46,33 +46,99 @@ enum ClaudeSessionFactory {
         // GUI-launched apps inherit launchd's thin PATH; prepend the user-local
         // bin locations so Claude Code's node-backed hooks / MCP clients work.
         env["PATH"] = augmentedPATH(current: env["PATH"])
+        // LANG / LC_CTYPE: launchd-launched macOS apps don't inherit these,
+        // which drops the child to the C locale and mangles UTF-8 input
+        // (Japanese typed through IME arrives as Latin-1 bytes, claude /
+        // node see them as mojibake). Default to en_US.UTF-8 only if the
+        // user hasn't already configured something — respecting their
+        // explicit choice is important for non-en users.
+        if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
+        if env["LC_CTYPE"] == nil { env["LC_CTYPE"] = "UTF-8" }
+
+        // Pass task.body via argv, not libghostty's initial_input:
+        // - initial_input round-trips through std.zig.stringEscape inside
+        //   libghostty, which mangles non-ASCII UTF-8 bytes (user observed
+        //   mojibake on Japanese prompts).
+        // - initial_input also changes UX: it behaves like the user typed the
+        //   prompt and is waiting to press Enter, not like `claude "body"`
+        //   which executes immediately.
+        // Instead: let ghostty's `.shell` command mode hand the string to
+        //   /bin/sh -c, with task.body shell-quoted.
+        let commandLine: String
+        if task.body.isEmpty {
+            commandLine = shellQuote(executable.path)
+        } else {
+            commandLine = "\(shellQuote(executable.path)) \(shellQuote(task.body))"
+        }
 
         return TerminalSurface(
             id: task.id,
-            command: executable.path,
+            command: commandLine,
             workingDirectory: worktreeURL.path,
-            initialInput: task.body.isEmpty ? nil : task.body,
+            initialInput: nil,
             environment: env
         )
+    }
+
+    /// Single-quote shell escaping. Any `'` in the input is rewritten as
+    /// `'\''` (close single-quote, escaped single-quote, reopen). Robust for
+    /// everything except control characters, which neither claude nor our
+    /// task body should carry.
+    static func shellQuote(_ s: String) -> String {
+        if s.isEmpty { return "''" }
+        let escaped = s.replacingOccurrences(of: "'", with: "'\\''")
+        return "'\(escaped)'"
     }
 
     // MARK: - PATH / executable helpers (unchanged from pre-Milestone-D)
 
     /// Augment the child process PATH with typical user-local dev toolchain
-    /// locations so claude / its node hooks / MCP clients resolve.
+    /// locations so claude / its node hooks / MCP clients resolve. Covers:
+    ///   - Direct installs: ~/.local/bin, /opt/homebrew, /usr/local
+    ///   - Per-user toolchain managers: volta, cargo, bun, deno
+    ///   - node version managers: asdf shims, mise shims, fnm default, nvm
+    ///     (nvm's current version is dynamically selected so we best-effort
+    ///     glob the newest `versions/node/v*/bin` at lookup time)
     static func augmentedPATH(current: String?) -> String {
         let home = NSHomeDirectory()
-        let additions = [
+        let fm = FileManager.default
+
+        var additions: [String] = [
             "\(home)/.local/bin",
             "\(home)/.volta/bin",
             "\(home)/.cargo/bin",
             "\(home)/.bun/bin",
             "\(home)/.deno/bin",
+            // node version managers
+            "\(home)/.asdf/shims",
+            "\(home)/.local/share/mise/shims",
+            "\(home)/.fnm/aliases/default/bin",
+            "\(home)/.nodebrew/current/bin",
+            "\(home)/.nodenv/shims",
+            // Homebrew
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
             "/usr/local/bin",
             "/usr/local/sbin",
         ]
+
+        // nvm: pick the most recently modified `versions/node/v*/bin`.
+        // We can't read the user's `default` alias file reliably, but the
+        // newest install is a reasonable default for "just make it work".
+        let nvmRoot = "\(home)/.nvm/versions/node"
+        if let versions = try? fm.contentsOfDirectory(atPath: nvmRoot) {
+            let sorted = versions
+                .map { "\(nvmRoot)/\($0)" }
+                .sorted(by: {
+                    let lhs = (try? fm.attributesOfItem(atPath: $0)[.modificationDate] as? Date) ?? .distantPast
+                    let rhs = (try? fm.attributesOfItem(atPath: $1)[.modificationDate] as? Date) ?? .distantPast
+                    return lhs > rhs
+                })
+            if let newest = sorted.first {
+                additions.insert("\(newest)/bin", at: 0)
+            }
+        }
+
         let existing = (current ?? "").split(separator: ":").map(String.init)
         var seen = Set<String>()
         var ordered: [String] = []
