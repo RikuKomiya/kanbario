@@ -5,6 +5,9 @@ import SwiftUI
 struct TaskDetailView: View {
     @Environment(AppState.self) private var appState
 
+    /// Start ボタン連打防止。startTask が await している間 true。
+    @State private var isStarting = false
+
     var body: some View {
         Group {
             if let task = appState.selectedTask {
@@ -91,21 +94,35 @@ struct TaskDetailView: View {
                         )
                 }
 
-                // Milestone C 予定のアクション
+                // libghostty ターミナルペイン。surface が生きている間だけ出す。
+                if let surface = appState.activeSurfaces[task.id] {
+                    terminalPane(task: task, surface: surface)
+                }
+
+                // Milestone C: Start ボタン
                 HStack {
                     Button {
-                        // TODO: Phase C
+                        isStarting = true
+                        Task {
+                            await appState.startTask(task)
+                            isStarting = false
+                        }
                     } label: {
                         HStack(spacing: 6) {
-                            Image(systemName: "play.fill")
-                            Text("Start")
+                            if isStarting {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "play.fill")
+                            }
+                            Text(isStarting ? "Starting…" : "Start")
                         }
-                        .frame(minWidth: 80)
+                        .frame(minWidth: 90)
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(task.status != .planning)
-                    .help(task.status == .planning ? "Start Claude (Milestone C)" : "Only planning tasks can be started")
+                    .disabled(!canStart(task))
+                    .help(startHelpText(task))
 
                     Spacer()
                 }
@@ -113,6 +130,61 @@ struct TaskDetailView: View {
             }
             .padding(18)
         }
+    }
+
+    /// Start ボタンが押せるかの判定。planning 状態かつリポジトリ設定済み、
+    /// かつ起動中でない時のみ true。
+    private func canStart(_ task: TaskCard) -> Bool {
+        task.status == .planning && appState.canStartTasks && !isStarting
+    }
+
+    /// ヘッダ + GhosttyTerminalView + Stop ボタン。入力は GhosttyNSView が
+    /// 直接 libghostty の surface に渡すので、別の input field は持たない。
+    @ViewBuilder
+    private func terminalPane(task: TaskCard, surface: TerminalSurface) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // ヘッダ: running 表示 + Stop ボタン
+            HStack(spacing: 6) {
+                Image(systemName: "terminal.fill")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                Text("Session")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Text("running")
+                    .font(.caption2)
+                    .foregroundStyle(.green)
+                Spacer()
+                Button(role: .destructive) {
+                    appState.stopTask(id: task.id)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "stop.fill")
+                        Text("Stop")
+                    }
+                }
+                .controlSize(.small)
+                .help("SIGHUP を送って claude を止める")
+            }
+
+            let taskID = task.id
+            GhosttyTerminalView(
+                terminalSurface: surface,
+                onCloseRequested: { _ in
+                    appState.handleSurfaceClosed(taskID: taskID)
+                }
+            )
+            .frame(minHeight: 280, maxHeight: 520)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    /// 押せない理由を tooltip で開示する。
+    private func startHelpText(_ task: TaskCard) -> String {
+        if task.status != .planning { return "Only planning tasks can be started" }
+        if !appState.canStartTasks { return "Choose a repository first (toolbar)" }
+        if isStarting { return "Starting…" }
+        return "Start Claude (wt switch + claude spawn)"
     }
 
     private var placeholder: some View {

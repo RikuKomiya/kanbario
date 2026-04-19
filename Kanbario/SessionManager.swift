@@ -1,161 +1,169 @@
 import Foundation
-import Darwin
 
-/// PTY + Process を所有する actor。
+/// Factory that builds a `TerminalSurface` configured to run Claude Code
+/// inside a worktree, with the env / PATH needed for GUI-launched Xcode builds
+/// to still see Homebrew-installed `claude` + node.
 ///
-/// Milestone A: bash / echo を spawn → 標準出力のバイト列を AsyncStream で流す。
-/// 永続化 (GRDB) は Milestone B で追加予定。
-actor SessionManager {
+/// Milestone D refactor: libghostty now owns the PTY (see
+/// `GhosttyTerminalView.swift`), so this file no longer spawns via
+/// openpty + Foundation.Process. What's left is the "what command, where,
+/// with what env" decision — everything else is libghostty's job.
+enum ClaudeSessionFactory {
 
-    // MARK: - Types
+    enum Error: Swift.Error, CustomStringConvertible {
+        case claudeNotFound
 
-    struct SessionID: Hashable, Codable, CustomStringConvertible {
-        let raw: UUID
-        static func new() -> SessionID { SessionID(raw: UUID()) }
-        var description: String { raw.uuidString }
-    }
-
-    /// 1 セッション = 1 PTY + 1 子プロセス。
-    final class LiveSession {
-        let id: SessionID
-        let pid: Int32
-        let masterFD: Int32
-        /// PTY から読んだ生バイトのストリーム。購読者 1 つ前提の MVP 実装。
-        let bytes: AsyncStream<Data>
-        let continuation: AsyncStream<Data>.Continuation
-        /// 終了イベント。EOF / exit を通知する。
-        let termination: AsyncStream<Int32>
-        private let terminationCont: AsyncStream<Int32>.Continuation
-
-        init(id: SessionID, pid: Int32, masterFD: Int32) {
-            self.id = id
-            self.pid = pid
-            self.masterFD = masterFD
-            var byteCont: AsyncStream<Data>.Continuation!
-            self.bytes = AsyncStream<Data> { byteCont = $0 }
-            self.continuation = byteCont
-            var termCont: AsyncStream<Int32>.Continuation!
-            self.termination = AsyncStream<Int32> { termCont = $0 }
-            self.terminationCont = termCont
-        }
-
-        func push(_ data: Data) { continuation.yield(data) }
-        func finish(exitCode: Int32) {
-            continuation.finish()
-            terminationCont.yield(exitCode)
-            terminationCont.finish()
+        var description: String {
+            switch self {
+            case .claudeNotFound:
+                return "claude binary not found in PATH. `brew install claude` or set explicit path."
+            }
         }
     }
 
-    enum Error: Swift.Error {
-        case spawnFailed(underlying: Swift.Error)
-        case writeFailed(errno: Int32)
-        case sessionNotFound
-    }
-
-    // MARK: - State
-
-    private var sessions: [SessionID: LiveSession] = [:]
-    private var processes: [SessionID: Process] = [:]
-
-    // MARK: - API
-
-    /// コマンドを PTY 経由で起動する。
-    func start(executable: URL, arguments: [String] = [], cwd: URL? = nil,
-               environment: [String: String]? = nil,
-               cols: UInt16 = 120, rows: UInt16 = 40) async throws -> LiveSession {
-        let handles = try PTY.openpty(cols: cols, rows: rows)
-
-        let process = Process()
-        process.executableURL = executable
-        process.arguments = arguments
-        if let cwd { process.currentDirectoryURL = cwd }
-        if let environment { process.environment = environment }
-
-        let slaveHandle = FileHandle(fileDescriptor: handles.slave, closeOnDealloc: false)
-        process.standardInput  = slaveHandle
-        process.standardOutput = slaveHandle
-        process.standardError  = slaveHandle
-
-        do {
-            try process.run()
-        } catch {
-            close(handles.master)
-            close(handles.slave)
-            throw Error.spawnFailed(underlying: error)
+    /// Build a `TerminalSurface` for the given task inside `worktreeURL`.
+    /// The surface is not yet attached to a view — the SwiftUI wrapper will
+    /// `attachToView` when the NSView materializes.
+    static func makeSurface(
+        task: TaskCard,
+        worktreeURL: URL,
+        claudeExecutable: URL? = nil
+    ) throws -> TerminalSurface {
+        let executable: URL
+        if let explicit = claudeExecutable {
+            executable = explicit
+        } else if let found = locateExecutable("claude") {
+            executable = found
+        } else {
+            throw Error.claudeNotFound
         }
 
-        // 親側は slave を閉じる (子だけが保持すべき)
-        close(handles.slave)
+        // Inherit launchd env, then augment what claude / hook scripts need.
+        var env = ProcessInfo.processInfo.environment
+        env["KANBARIO_SURFACE_ID"] = task.id.uuidString
+        env["KANBARIO_TASK_ID"] = task.id.uuidString
+        env["TERM"] = env["TERM"] ?? "xterm-256color"
+        // GUI-launched apps inherit launchd's thin PATH; prepend the user-local
+        // bin locations so Claude Code's node-backed hooks / MCP clients work.
+        env["PATH"] = augmentedPATH(current: env["PATH"])
+        // LANG / LC_CTYPE: launchd-launched macOS apps don't inherit these,
+        // which drops the child to the C locale and mangles UTF-8 input
+        // (Japanese typed through IME arrives as Latin-1 bytes, claude /
+        // node see them as mojibake). Default to en_US.UTF-8 only if the
+        // user hasn't already configured something — respecting their
+        // explicit choice is important for non-en users.
+        if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
+        if env["LC_CTYPE"] == nil { env["LC_CTYPE"] = "UTF-8" }
 
-        let session = LiveSession(
-            id: .new(),
-            pid: process.processIdentifier,
-            masterFD: handles.master
+        // Pass task.body via argv, not libghostty's initial_input:
+        // - initial_input round-trips through std.zig.stringEscape inside
+        //   libghostty, which mangles non-ASCII UTF-8 bytes (user observed
+        //   mojibake on Japanese prompts).
+        // - initial_input also changes UX: it behaves like the user typed the
+        //   prompt and is waiting to press Enter, not like `claude "body"`
+        //   which executes immediately.
+        // Instead: let ghostty's `.shell` command mode hand the string to
+        //   /bin/sh -c, with task.body shell-quoted.
+        let commandLine: String
+        if task.body.isEmpty {
+            commandLine = shellQuote(executable.path)
+        } else {
+            commandLine = "\(shellQuote(executable.path)) \(shellQuote(task.body))"
+        }
+
+        return TerminalSurface(
+            id: task.id,
+            command: commandLine,
+            workingDirectory: worktreeURL.path,
+            initialInput: nil,
+            environment: env
         )
-        sessions[session.id] = session
-        processes[session.id] = process
-
-        // PTY master から非同期で読み続ける
-        let masterFD = handles.master
-        let sid = session.id
-        let wrappedSession = session
-        let wrappedProcess = process
-
-        _Concurrency.Task.detached(priority: .userInitiated) { [weak self] in
-            await Self.readLoop(masterFD: masterFD, session: wrappedSession,
-                                process: wrappedProcess,
-                                onExit: { exitCode in
-                                    await self?.sessionEnded(id: sid, exitCode: exitCode)
-                                })
-        }
-
-        return session
     }
 
-    /// セッションに入力バイトを書き込む (PTY master 経由で子プロセスの stdin に)。
-    func write(to id: SessionID, bytes: Data) throws {
-        guard let session = sessions[id] else { throw Error.sessionNotFound }
-        let n = bytes.withUnsafeBytes { buf -> Int in
-            Darwin.write(session.masterFD, buf.baseAddress, buf.count)
-        }
-        if n < 0 { throw Error.writeFailed(errno: errno) }
+    /// Single-quote shell escaping. Any `'` in the input is rewritten as
+    /// `'\''` (close single-quote, escaped single-quote, reopen). Robust for
+    /// everything except control characters, which neither claude nor our
+    /// task body should carry.
+    static func shellQuote(_ s: String) -> String {
+        if s.isEmpty { return "''" }
+        let escaped = s.replacingOccurrences(of: "'", with: "'\\''")
+        return "'\(escaped)'"
     }
 
-    /// 全稼働セッションの ID。
-    func liveSessionIDs() -> [SessionID] { Array(sessions.keys) }
+    // MARK: - PATH / executable helpers (unchanged from pre-Milestone-D)
 
-    // MARK: - Internals
+    /// Augment the child process PATH with typical user-local dev toolchain
+    /// locations so claude / its node hooks / MCP clients resolve. Covers:
+    ///   - Direct installs: ~/.local/bin, /opt/homebrew, /usr/local
+    ///   - Per-user toolchain managers: volta, cargo, bun, deno
+    ///   - node version managers: asdf shims, mise shims, fnm default, nvm
+    ///     (nvm's current version is dynamically selected so we best-effort
+    ///     glob the newest `versions/node/v*/bin` at lookup time)
+    static func augmentedPATH(current: String?) -> String {
+        let home = NSHomeDirectory()
+        let fm = FileManager.default
 
-    private func sessionEnded(id: SessionID, exitCode: Int32) {
-        if let session = sessions[id] { session.finish(exitCode: exitCode) }
-        sessions.removeValue(forKey: id)
-        processes.removeValue(forKey: id)
-    }
+        var additions: [String] = [
+            "\(home)/.local/bin",
+            "\(home)/.volta/bin",
+            "\(home)/.cargo/bin",
+            "\(home)/.bun/bin",
+            "\(home)/.deno/bin",
+            // node version managers
+            "\(home)/.asdf/shims",
+            "\(home)/.local/share/mise/shims",
+            "\(home)/.fnm/aliases/default/bin",
+            "\(home)/.nodebrew/current/bin",
+            "\(home)/.nodenv/shims",
+            // Homebrew
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+        ]
 
-    /// PTY master fd を read し続け、EOF で終了。actor の isolation 外で動かす。
-    private static func readLoop(masterFD: Int32, session: LiveSession, process: Process,
-                                 onExit: @escaping (Int32) async -> Void) async {
-        let bufferSize = 4096
-        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
-        defer { buf.deallocate() }
-
-        while true {
-            let n = Darwin.read(masterFD, buf, bufferSize)
-            if n > 0 {
-                let data = Data(bytes: buf, count: n)
-                session.push(data)
-            } else if n == 0 {
-                // EOF: 子が stdout/stderr を閉じた
-                break
-            } else {
-                // n < 0: EIO (子が terminate して PTY が閉じた) 等
-                break
+        // nvm: pick the most recently modified `versions/node/v*/bin`.
+        // We can't read the user's `default` alias file reliably, but the
+        // newest install is a reasonable default for "just make it work".
+        let nvmRoot = "\(home)/.nvm/versions/node"
+        if let versions = try? fm.contentsOfDirectory(atPath: nvmRoot) {
+            let sorted = versions
+                .map { "\(nvmRoot)/\($0)" }
+                .sorted(by: {
+                    let lhs = (try? fm.attributesOfItem(atPath: $0)[.modificationDate] as? Date) ?? .distantPast
+                    let rhs = (try? fm.attributesOfItem(atPath: $1)[.modificationDate] as? Date) ?? .distantPast
+                    return lhs > rhs
+                })
+            if let newest = sorted.first {
+                additions.insert("\(newest)/bin", at: 0)
             }
         }
 
-        close(masterFD)
-        process.waitUntilExit()
-        await onExit(process.terminationStatus)
+        let existing = (current ?? "").split(separator: ":").map(String.init)
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for p in additions + existing where !p.isEmpty {
+            if seen.insert(p).inserted { ordered.append(p) }
+        }
+        return ordered.joined(separator: ":")
+    }
+
+    /// Look up an executable name from PATH + Homebrew fallbacks.
+    static func locateExecutable(_ name: String) -> URL? {
+        let envPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map(String.init)
+        let fallbacks = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/Users/\(NSUserName())/.local/bin",
+        ]
+        var seen = Set<String>()
+        for dir in envPaths + fallbacks where seen.insert(dir).inserted {
+            let candidate = URL(fileURLWithPath: dir).appendingPathComponent(name)
+            if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
     }
 }
