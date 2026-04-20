@@ -9,20 +9,57 @@ struct TaskDetailView: View {
     @State private var isStarting = false
 
     var body: some View {
-        Group {
-            if let task = appState.selectedTask {
-                detail(for: task)
-                    .transition(.asymmetric(
-                        insertion: .opacity,
-                        removal: .opacity
-                    ))
-            } else {
-                placeholder
+        VStack(spacing: 0) {
+            Group {
+                if let task = appState.selectedTask {
+                    detail(for: task)
+                        .transition(.asymmetric(
+                            insertion: .opacity,
+                            removal: .opacity
+                        ))
+                } else {
+                    placeholder
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            terminalArea
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(.windowBackgroundColor))
         .animation(.smooth(duration: 0.25), value: appState.selectedTaskID)
+    }
+
+    /// 全 active surface を常時マウントする terminal area。
+    ///
+    /// libghostty の surface は NSView と寿命を共有する設計 (surface 内で nsview
+    /// ポインタを直接保持) なので、SwiftUI に view identity を切り替えさせると
+    /// `dismantleNSView` → `ghostty_surface_free` → 子プロセス (claude) に SIGHUP
+    /// で claude が殺される。さらに activeSurfaces 側はゾンビ TerminalSurface が
+    /// 残るので、再表示で `viewDidMoveToWindow` → `attachToView` → surface == nil →
+    /// `createSurface` で **新しい claude が fork** されてしまう (ユーザー報告
+    /// バグ #1 / #2 の根本原因)。
+    ///
+    /// 対策: ZStack で全 surface を重ね、選択中以外は `.opacity(0)` +
+    /// `.allowsHitTesting(false)`。view identity が安定するので NSView は
+    /// 「surface が本当に消える時」(Stop / hook close / done drag) だけ
+    /// dismantle される正しい semantics になる。
+    @ViewBuilder
+    private var terminalArea: some View {
+        let activeIDs = Array(appState.activeSurfaces.keys)
+        if !activeIDs.isEmpty {
+            ZStack {
+                ForEach(activeIDs, id: \.self) { taskID in
+                    if let surface = appState.activeSurfaces[taskID],
+                       let task = appState.tasks.first(where: { $0.id == taskID }) {
+                        terminalPane(task: task, surface: surface)
+                            .opacity(taskID == appState.selectedTaskID ? 1 : 0)
+                            .allowsHitTesting(taskID == appState.selectedTaskID)
+                    }
+                }
+            }
+            .frame(minHeight: 280, maxHeight: 520)
+            .padding([.horizontal, .bottom], 18)
+        }
     }
 
     private func detail(for task: TaskCard) -> some View {
@@ -94,10 +131,9 @@ struct TaskDetailView: View {
                         )
                 }
 
-                // libghostty ターミナルペイン。surface が生きている間だけ出す。
-                if let surface = appState.activeSurfaces[task.id] {
-                    terminalPane(task: task, surface: surface)
-                }
+                // libghostty ターミナルペインは ScrollView 外の `terminalArea`
+                // に移動 (全 active surface を常時マウントして claude 殺害を回避、
+                // 詳細は terminalArea のコメント参照)。
 
                 // Milestone C: Start ボタン
                 HStack {
@@ -142,18 +178,22 @@ struct TaskDetailView: View {
     /// 直接 libghostty の surface に渡すので、別の input field は持たない。
     @ViewBuilder
     private func terminalPane(task: TaskCard, surface: TerminalSurface) -> some View {
+        let activity = appState.activitiesByTaskID[task.id]
         VStack(alignment: .leading, spacing: 6) {
-            // ヘッダ: running 表示 + Stop ボタン
+            // ヘッダ: activity ラベル + Stop ボタン
             HStack(spacing: 6) {
                 Image(systemName: "terminal.fill")
                     .font(.caption)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(sessionTint(activity))
                 Text("Session")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(.secondary)
-                Text("running")
+                Text(sessionLabel(activity))
                     .font(.caption2)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(sessionTint(activity))
+                if let activity {
+                    ActivityBadge(activity: activity)
+                }
                 Spacer()
                 Button(role: .destructive) {
                     appState.stopTask(id: task.id)
@@ -176,6 +216,24 @@ struct TaskDetailView: View {
             )
             .frame(minHeight: 280, maxHeight: 520)
             .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    /// Session ヘッダの左側テキスト。activity 不明 (= session-end 後など) は
+    /// ニュートラルな "idle" にフォールバックする。
+    private func sessionLabel(_ activity: ClaudeActivity?) -> String {
+        switch activity {
+        case .running:    return "working"
+        case .needsInput: return "awaiting input"
+        case nil:         return "idle"
+        }
+    }
+
+    private func sessionTint(_ activity: ClaudeActivity?) -> Color {
+        switch activity {
+        case .running:    return .green
+        case .needsInput: return .orange
+        case nil:         return Color(nsColor: .secondaryLabelColor)
         }
     }
 
