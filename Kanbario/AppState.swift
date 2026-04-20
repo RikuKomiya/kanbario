@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import UserNotifications
 
 /// アプリ全体のルート状態。SwiftUI View から `@Environment(AppState.self)` で参照。
 ///
@@ -66,6 +67,7 @@ final class AppState {
             configureWorktreeService()
         }
         startHookReceiver()
+        NotificationService.shared.requestAuthorizationIfNeeded()
     }
 
     deinit {
@@ -259,10 +261,13 @@ final class AppState {
             activitiesByTaskID.removeValue(forKey: id)
 
         case "notification":
-            // MVP では未対応 (UNUserNotificationCenter は entitlement が要るため
-            // 後回し)。Stop による review カラム遷移が「ユーザーの番」を
-            // ボード上で表現するので、最低限の可視化はカバーできている。
-            break
+            // claude の Notification hook は tool 承認待ち / idle タイムアウト等で
+            // 発火する。ユーザーが kanbario を裏に回していると気付けないので、
+            // macOS Notification Center に昇格する。タスクタイトルを title に、
+            // payload.message を body に。message が取れなければ generic 文言。
+            let body = Self.extractNotificationMessage(from: message.payload)
+                ?? "Claude から通知があります"
+            NotificationService.shared.post(title: tasks[idx].title, body: body)
 
         default:
             break
@@ -377,5 +382,60 @@ final class AppState {
             return PersistedState(tasks: v1, repoPath: "")
         }
         return nil
+    }
+
+    // MARK: - Notification payload
+
+    /// Notification hook の stdin JSON から `message` フィールドだけ抜く。
+    /// Claude Code は `{ "hook_event_name": "Notification", "message": "..." }`
+    /// 形式で渡してくる (他フィールドは無視してよい)。
+    fileprivate static func extractNotificationMessage(from payload: String) -> String? {
+        guard let data = payload.data(using: .utf8) else { return nil }
+        struct NotificationPayload: Decodable { let message: String? }
+        let decoded = try? JSONDecoder().decode(NotificationPayload.self, from: data)
+        return decoded?.message?.isEmpty == false ? decoded?.message : nil
+    }
+}
+
+// MARK: - NotificationService
+
+/// macOS Notification Center の薄いラッパ。
+///
+/// App Sandbox = NO なので UNUserNotificationCenter の追加 entitlement は不要。
+/// 初回 post で OS の permission dialog が出る (拒否時は silent no-op)。
+/// 権限が確定するまで post を呼ぶと OS 側で黙って捨てられるだけなので、
+/// authorized フラグによる早期 return は必須ではないが、無駄な OS 呼び出しを
+/// 抑えるために保持している。
+@MainActor
+fileprivate final class NotificationService {
+    static let shared = NotificationService()
+
+    private var authorized = false
+    private var requested = false
+
+    private init() {}
+
+    func requestAuthorizationIfNeeded() {
+        guard !requested else { return }
+        requested = true
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .sound]
+        ) { [weak self] granted, _ in
+            Task { @MainActor in self?.authorized = granted }
+        }
+    }
+
+    func post(title: String, body: String) {
+        guard authorized else { return }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let req = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
     }
 }

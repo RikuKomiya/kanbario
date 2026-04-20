@@ -88,7 +88,8 @@ struct KanbanColumn: View {
             TaskCardView(
                 task: task,
                 accent: statusTint,
-                isSelected: appState.selectedTaskID == task.id
+                isSelected: appState.selectedTaskID == task.id,
+                activity: appState.activitiesByTaskID[task.id]
             )
         }
         .buttonStyle(.plain)
@@ -228,6 +229,9 @@ struct TaskCardView: View {
     let task: TaskCard
     var accent: Color = .gray
     var isSelected: Bool = false
+    /// hook event で更新される即時状態。nil なら何も描画しない
+    /// (= planning / done、もしくは session-end 後)。
+    var activity: ClaudeActivity? = nil
 
     @State private var isHovering = false
 
@@ -242,6 +246,10 @@ struct TaskCardView: View {
                     .font(.system(.body, weight: .medium))
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
+                if let activity {
+                    Spacer(minLength: 4)
+                    ActivityBadge(activity: activity)
+                }
             }
             .fixedSize(horizontal: false, vertical: true)
 
@@ -309,5 +317,47 @@ struct DropPlaceholderCard: View {
                               style: StrokeStyle(lineWidth: 1.5, dash: [5, 3]))
         )
         .opacity(0.8)
+    }
+}
+
+// MARK: - Activity badge
+
+/// カード右上に出す「claude が何をしているか」の小バッジ。
+/// カラムの意味論 (inProgress / review) はボード全体で伝わるので、
+/// ここでは 1 カード単位の finer-grained な信号を 1 行で見せる。
+struct ActivityBadge: View {
+    let activity: ClaudeActivity
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .bold))
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(color.opacity(0.15))
+        .foregroundStyle(color)
+        .clipShape(Capsule())
+    }
+
+    private var icon: String {
+        switch activity {
+        case .running:    return "bolt.fill"
+        case .needsInput: return "person.wave.2.fill"
+        }
+    }
+    private var label: String {
+        switch activity {
+        case .running:    return "Working"
+        case .needsInput: return "Your turn"
+        }
+    }
+    private var color: Color {
+        switch activity {
+        case .running:    return .blue
+        case .needsInput: return .orange
+        }
     }
 }
