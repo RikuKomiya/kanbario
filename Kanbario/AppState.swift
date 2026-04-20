@@ -34,6 +34,26 @@ final class AppState {
     /// 詳細画面のバッジ表示用 (Models.swift の `ClaudeActivity` 参照)。
     var activitiesByTaskID: [UUID: ClaudeActivity] = [:]
 
+    /// true の間は選択中タスクの terminal を全画面モーダル相当で表示する。
+    /// 実装は ZStack で frame を拡大するだけなので、NSView identity は不変で
+    /// claude は殺されない (terminalArea のコメント参照)。
+    var isTerminalExpanded: Bool = false
+
+    /// expanded 中に ⌘T で開く「普通のシェル」タブ。claude と違ってタスクに
+    /// 紐付かず、ユーザーが明示的に閉じるまで live。辞書 + 順序配列のペアで
+    /// 管理しているのはタブ並び順を保持しつつ surface を O(1) 引けるようにする
+    /// ため (SwiftDictionary は順序非保持)。
+    var shellSurfaces: [UUID: TerminalSurface] = [:]
+    var shellTabOrder: [UUID] = []
+
+    /// terminalArea で「今表示すべき surface」の ID。
+    /// - nil: 選択中タスクの claude surface (従来挙動)
+    /// - non-nil かつ shellSurfaces にある: その shell タブ
+    ///
+    /// タスク切替時は自動的に claude 側に戻す (選択中タスクが変わったのに
+    /// 別 shell を見続けるのは混乱するため)。
+    var selectedTerminalID: UUID?
+
     /// デモ用のデフォルトプロジェクト。MVP は 1 プロジェクト前提。
     let defaultProject: Project
 
@@ -197,6 +217,49 @@ final class AppState {
         activeSurfaces[id]?.requestClose()
     }
 
+    // MARK: - Shell tabs (expanded 中 ⌘T で開く普通のターミナル)
+
+    /// 新しい shell タブを開き、activeSurfaces に追加して選択中にする。
+    /// 起動 shell はユーザーの `$SHELL` (fallback `/bin/zsh`)、worktree ではなく
+    /// repo root を cwd にする (タスクと独立した作業領域として扱う)。
+    @discardableResult
+    func openShellTab() -> UUID? {
+        let id = UUID()
+        let surface = ShellTabFactory.makeSurface(
+            id: id,
+            workingDirectory: repoPath.isEmpty ? nil : repoPath
+        )
+        shellSurfaces[id] = surface
+        shellTabOrder.append(id)
+        selectedTerminalID = id
+        return id
+    }
+
+    /// ユーザーが shell タブを閉じた時。libghostty に SIGHUP を送ってもらい、
+    /// close_surface_cb → handleShellTabClosed で actual cleanup。UI は即座に
+    /// 「閉じた」フィードバックを返したいので selectedTerminalID は先に動かす。
+    func requestCloseShellTab(id: UUID) {
+        shellSurfaces[id]?.requestClose()
+    }
+
+    /// `GhosttyNSView.onCloseRequested` 経由で呼ばれる (shell タブ側)。
+    /// タブ配列から除去、選択中なら別タブ or claude に戻す。
+    func handleShellTabClosed(id: UUID) {
+        guard shellSurfaces[id] != nil else { return }
+        shellSurfaces[id]?.teardown()
+        shellSurfaces.removeValue(forKey: id)
+        let removedIdx = shellTabOrder.firstIndex(of: id)
+        shellTabOrder.removeAll { $0 == id }
+        if selectedTerminalID == id {
+            // 可能なら直前のタブ、無ければ末尾、無ければ claude (= nil)
+            if let idx = removedIdx, idx > 0, idx - 1 < shellTabOrder.count {
+                selectedTerminalID = shellTabOrder[idx - 1]
+            } else {
+                selectedTerminalID = shellTabOrder.last
+            }
+        }
+    }
+
     /// `GhosttyNSView.onCloseRequested` 経由で呼ばれる。libghostty が子プロセス
     /// 終了を検知したタイミングで review に飛ばす。
     func handleSurfaceClosed(taskID: UUID) {
@@ -204,6 +267,16 @@ final class AppState {
         activeSurfaces.removeValue(forKey: taskID)
         activitiesByTaskID.removeValue(forKey: taskID)
         applyStatus(id: taskID, to: .review)
+        collapseTerminalIfEmpty()
+    }
+
+    /// expanded モードを維持する surface が 1 つも無くなったら自動で解除する。
+    /// 「surface ゼロ」= terminalArea が空 = expanded には意味がない状態。
+    private func collapseTerminalIfEmpty() {
+        if activeSurfaces.isEmpty && shellSurfaces.isEmpty {
+            isTerminalExpanded = false
+            selectedTerminalID = nil
+        }
     }
 
     // MARK: - Hook receiver
@@ -316,6 +389,7 @@ final class AppState {
             }
             activeSurfaces.removeValue(forKey: task.id)
             activitiesByTaskID.removeValue(forKey: task.id)
+            collapseTerminalIfEmpty()
         }
 
         if let wt = worktreeService {

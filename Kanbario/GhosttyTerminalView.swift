@@ -943,8 +943,15 @@ extension GhosttyNSView: NSTextInputClient {
 /// SwiftUI bridge. One `GhosttyTerminalView` maps 1:1 to a kanbario task — the
 /// `TerminalSurface` instance is passed in by the caller so session lifetime
 /// matches the kanban card, not the SwiftUI view identity.
+///
+/// `isSelected` はタブ / タスク切替時に呼び出し側が渡す。true に遷移した時
+/// `makeFirstResponder(self)` で NSWindow の firstResponder を強制的に差し替える
+/// — これをやらないと、SwiftUI のレイヤでいくら opacity/hitTesting を切っても
+/// キーボード入力は前回の first responder (= 旧 surface) に流れ続けるため、
+/// 新タブに文字を打っても旧タスクの claude に bytes が届いてしまう。
 struct GhosttyTerminalView: NSViewRepresentable {
     let terminalSurface: TerminalSurface
+    var isSelected: Bool = true
     var onCloseRequested: ((_ needsConfirm: Bool) -> Void)?
 
     func makeNSView(context: Context) -> GhosttyNSView {
@@ -955,6 +962,36 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
     func updateNSView(_ nsView: GhosttyNSView, context: Context) {
         nsView.onCloseRequested = onCloseRequested
+
+        // 選択状態が変わったら firstResponder を強制遷移。guard で「既に自分が
+        // firstResponder」の場合はスキップし、毎 update ごとの冗長な
+        // makeFirstResponder 呼び出しを避ける (IME composition 中などに
+        // firstResponder をつけ直すと marked text が壊れる)。
+        //
+        // 初回 updateNSView 時点では nsView.window がまだ nil のことがある
+        // (SwiftUI の NSViewRepresentable は makeNSView → updateNSView →
+        // superview 追加 → viewDidMoveToWindow の順)。その場合は main queue
+        // 上で 1 ターン遅延させて再試行する。
+        if isSelected {
+            let promote: () -> Void = {
+                if let window = nsView.window, window.firstResponder !== nsView {
+                    window.makeFirstResponder(nsView)
+                }
+            }
+            if nsView.window != nil {
+                promote()
+            } else {
+                DispatchQueue.main.async { promote() }
+            }
+        } else {
+            // 非選択化時は focus を明示的に落とす。NSWindow.firstResponder は
+            // マウス等で触らない限り居座るので、ghostty_surface_set_focus を
+            // 先に false にしておくと PTY 側で bel / cursor blink 等の
+            // idle 挙動に切り替わり、裏タブの描画負荷も最小になる。
+            if let surface = nsView.runtimeSurface {
+                ghostty_surface_set_focus(surface, false)
+            }
+        }
     }
 
     static func dismantleNSView(_ nsView: GhosttyNSView, coordinator: ()) {
