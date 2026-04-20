@@ -173,3 +173,39 @@ fi
 
 echo "==> Creating symlink for GhosttyKit.xcframework..."
 ln -sfn "$CACHE_XCFRAMEWORK" GhosttyKit.xcframework
+
+# Terminfo: ghostty の build output が生成する terminfo ディレクトリを
+# Resources/terminfo に symlink する。cmux と同じく xterm-ghostty terminfo
+# を app bundle に同梱して、TERM=xterm-ghostty のまま lazygit / vi / tmux
+# が動くようにするため (README 参照)。
+#
+# ghostty の `zig build` は ReleaseLocal (Ghostty.app) と ReleaseFast の両方を
+# 残すので、存在するほうから拾う。見つからなくても build は続行 (Swift 側の
+# GhosttyTerminfoInstaller が保険として ~/.terminfo へ copy する)。
+GHOSTTY_TERMINFO_CANDIDATES=(
+  "$PROJECT_DIR/ghostty/macos/build/ReleaseLocal/Ghostty.app/Contents/Resources/terminfo"
+  "$PROJECT_DIR/ghostty/zig-out/share/terminfo"
+)
+GHOSTTY_TERMINFO_SRC=""
+for candidate in "${GHOSTTY_TERMINFO_CANDIDATES[@]}"; do
+  if [[ -d "$candidate" ]]; then
+    GHOSTTY_TERMINFO_SRC="$candidate"
+    break
+  fi
+done
+
+if [[ -n "$GHOSTTY_TERMINFO_SRC" ]]; then
+  # Xcode の Run Script sandbox は、symlink 先が project 外ディレクトリ
+  # (e.g. ghostty/macos/build/...) だと cp -RL を permission エラーで弾く。
+  # そのため symlink ではなく実ファイルを copy して Resources/terminfo を
+  # 自己完結させる。source 側が更新された時は ensure-ghosttykit.sh 再実行で
+  # 追従する (= ghostty rebuild したらこの script も走る運用)。
+  echo "==> Copying terminfo: $GHOSTTY_TERMINFO_SRC → Resources/terminfo"
+  rm -rf "$PROJECT_DIR/Resources/terminfo"
+  mkdir -p "$PROJECT_DIR/Resources"
+  cp -R "$GHOSTTY_TERMINFO_SRC" "$PROJECT_DIR/Resources/terminfo"
+else
+  echo "==> warn: ghostty terminfo source not found; Resources/terminfo not linked"
+  echo "    candidates:"
+  printf '      %s\n' "${GHOSTTY_TERMINFO_CANDIDATES[@]}"
+fi

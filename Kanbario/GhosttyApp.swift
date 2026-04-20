@@ -104,6 +104,7 @@ final class GhosttyApp {
     private var appObservers: [NSObjectProtocol] = []
 
     private init() {
+        GhosttyTerminfoInstaller.installIfNeeded()
         initializeGhostty()
     }
 
@@ -124,15 +125,42 @@ final class GhosttyApp {
             return
         }
 
-        // macos-background-from-layer: let libghostty paint through the NSView's
-        //   CAMetalLayer background, which is what we want for embedded panes.
-        // shell-integration = none: Claude Code drives its own prompt, so we
-        //   don't want Ghostty injecting rcfile hooks into the child shell.
+        // 設定は「後 load 勝ち」なので、先に user、後に kanbario 固定値の順で積む。
+        //
+        // 1) ユーザーの ~/.config/ghostty/config (XDG) と default locations を読む
+        //    → font-family, theme, keybind, background-opacity などをそのまま反映
+        // 2) ghostty_config_load_recursive_files で `config-file = ...` の include も展開
+        // 3) 最後に kanbario が絶対譲れない 2 項目を上書き:
+        //    - macos-background-from-layer = true: CAMetalLayer の背景透過と合わせないと
+        //      埋め込みペインで描画が黒く潰れる
+        //    - shell-integration = none: Claude Code は独自プロンプトを持つので
+        //      ghostty の rcfile 注入は誤作動の原因になる (Milestone C で確認済み)
+        logConfigLoadCandidates()
+        ghostty_config_load_default_files(config)
+        ghostty_config_load_recursive_files(config)
+
+        // kanbario は cmux と同じく app bundle に ghostty terminfo を同梱して
+        // いる (scripts/ensure-ghosttykit.sh → Resources/terminfo → Copy Ghostty
+        // Terminfo build phase で Contents/Resources/terminfo/ に配置)。
+        // 子プロセスには TERMINFO_DIRS env で bundled terminfo を指すので、
+        // TERM=xterm-ghostty のままで lazygit / vi / tmux が動く。したがって
+        // term の上書きは不要 (ghostty default の xterm-ghostty をそのまま活かす)。
+        //
+        // bell-features: BEL 文字 (\\a) で鳴る音/システムフィードバックを絞る。
+        //   - `no-audio`: ghostty 自前の音声再生を止める
+        //   - `no-system`: macOS の NSBeep を鳴らさない
+        //   - title / attention は残して、裏で通知が必要な時の視覚的手掛かりは保持
         loadInlineConfig(
-            "macos-background-from-layer = true\nshell-integration = none",
+            """
+            macos-background-from-layer = true
+            shell-integration = none
+            bell-features = no-audio, no-system
+            """,
             into: config
         )
         ghostty_config_finalize(config)
+
+        reportConfigDiagnostics(config)
 
         var runtimeConfig = ghostty_runtime_config_s()
         runtimeConfig.userdata = Unmanaged.passUnretained(self).toOpaque()
@@ -264,6 +292,35 @@ final class GhosttyApp {
         return false
     }
 
+    /// `~/.config/ghostty/config` が **本当に** 読まれる位置にあるかを
+    /// Console.app から確認できるように NSLog で記録する。launchd 起動の
+    /// GUI アプリだと HOME や XDG_CONFIG_HOME が想定と違うことがあるため、
+    /// ユーザーから「ghostty の設定が反映されない」と言われた時に真っ先に
+    /// 確認できる手掛かりにする。
+    private func logConfigLoadCandidates() {
+        let fm = FileManager.default
+        let home = NSHomeDirectory()
+        let xdg = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"] ?? "(unset)"
+        let candidate = "\(home)/.config/ghostty/config"
+        let exists = fm.fileExists(atPath: candidate)
+        NSLog("kanbario: ghostty config check — HOME=\(home) XDG_CONFIG_HOME=\(xdg) candidate=\(candidate) exists=\(exists)")
+    }
+
+    /// ユーザー config に書かれた typo / unknown key / invalid value を
+    /// NSLog に流す。silent に握り潰されるとユーザーは「なぜ設定が効かない
+    /// のか」デバッグする手段が無くなるので、最低限 log には残す。
+    private func reportConfigDiagnostics(_ config: ghostty_config_t) {
+        let count = ghostty_config_diagnostics_count(config)
+        guard count > 0 else { return }
+        for i in 0..<count {
+            let diag = ghostty_config_get_diagnostic(config, i)
+            if let messagePtr = diag.message {
+                let message = String(cString: messagePtr)
+                NSLog("kanbario: ghostty config diagnostic [\(i)]: \(message)")
+            }
+        }
+    }
+
     private func loadInlineConfig(_ contents: String, into config: ghostty_config_t) {
         let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -278,6 +335,86 @@ final class GhosttyApp {
         } catch {
             NSLog("kanbario: inline config load failed: \(error.localizedDescription)")
         }
+    }
+}
+
+// MARK: - Terminfo installer (lazygit / vi / tmux 対応の根本解決)
+//
+// ghostty のデフォルト `TERM=xterm-ghostty` は、その terminfo entry を ncurses
+// 系アプリ (lazygit の tcell、vim の termcap、tmux、less 等) が DB から引けて
+// 初めて正しく動く。system の `/usr/share/terminfo/` には xterm-ghostty は
+// 含まれないので、ghostty build output が持っている terminfo エントリを
+// ユーザー home の `~/.terminfo/` に install する。
+//
+// この場所に置く理由:
+// - ncurses は `TERMINFO` → `~/.terminfo` → system の順で DB を探索する
+//   (environ(5) の動作、ghostty でない tmux / screen セッションからも引ける)
+// - kanbario を終了しても永続化されるので、ユーザーが本家 Ghostty.app で
+//   作業する時も同じ terminfo が効く (害なし、むしろ便利)
+// - `TERMINFO_DIRS` を env で注入する方式だと子 → 孫プロセス (例: tmux の中で
+//   起動した lazygit) に継承されないケースがある。`~/.terminfo` に置けば
+//   そもそも継承問題が起きない
+//
+// cmux はアプリ bundle に terminfo を同梱し、`TERMINFO_DIRS` を上書きして
+// 同じことをしている。kanbario は bundle 同梱の Xcode project 設定を
+// 触らずに済むこちらの方式を選択。初回起動時 1 回だけ走る。
+enum GhosttyTerminfoInstaller {
+    /// 必要な terminfo entry がユーザー home に揃っていれば no-op、無ければ
+    /// source candidate から copy する。失敗してもアプリ全体は起動するよう
+    /// silent に log して終わる (terminfo なしでも xterm-256color にフォール
+    /// バックできるため)。
+    static func installIfNeeded() {
+        let fm = FileManager.default
+        let home = NSHomeDirectory()
+        let targetDir = "\(home)/.terminfo/78"
+        let targetPath = "\(targetDir)/xterm-ghostty"
+
+        if fm.fileExists(atPath: targetPath) {
+            return
+        }
+
+        guard let source = findSourceTerminfo() else {
+            NSLog("kanbario: terminfo installer — source xterm-ghostty not found, " +
+                  "lazygit/vi may misbehave under TERM=xterm-ghostty")
+            return
+        }
+
+        do {
+            try fm.createDirectory(atPath: targetDir, withIntermediateDirectories: true)
+            try fm.copyItem(atPath: source, toPath: targetPath)
+            NSLog("kanbario: terminfo installed \(source) → \(targetPath)")
+        } catch {
+            NSLog("kanbario: terminfo install failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// terminfo の source 候補。bundle 内 → ghostty build output の順に探す。
+    /// 将来 app bundle に `Resources/terminfo/` を同梱したら 1 番目がヒット
+    /// するようになる (配布ビルド対応)。現状は dev ビルドなので 2 番目。
+    private static func findSourceTerminfo() -> String? {
+        let fm = FileManager.default
+        var candidates: [String] = []
+
+        // 1) app bundle 同梱 (将来の配布時用)
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("terminfo/78/xterm-ghostty").path {
+            candidates.append(bundled)
+        }
+
+        // 2) dev 用: ghostty 作業ツリーの build output
+        //    kanbario repo root からの相対で解決する
+        let repoRootHints = [
+            Bundle.main.bundlePath + "/../..",   // .app/Contents から上 2 つ
+            "\(NSHomeDirectory())/mywork/kanbario",
+        ]
+        for hint in repoRootHints {
+            candidates.append("\(hint)/ghostty/macos/build/ReleaseLocal/Ghostty.app/Contents/Resources/terminfo/78/xterm-ghostty")
+        }
+
+        // 3) 本家 Ghostty.app が入っているなら流用
+        candidates.append("/Applications/Ghostty.app/Contents/Resources/terminfo/78/xterm-ghostty")
+
+        return candidates.first { fm.fileExists(atPath: $0) }
     }
 }
 

@@ -60,7 +60,18 @@ enum ClaudeSessionFactory {
         ) {
             env["KANBARIO_HOOK_CLI_PATH"] = cli.path
         }
-        env["TERM"] = env["TERM"] ?? "xterm-256color"
+        // TERM は **常に xterm-ghostty を強制**する。
+        // 理由: Xcode から debug run すると親 kanbario process に TERM=dumb が
+        // 仕込まれ (Xcode 自身が terminal を持たないため)、それをそのまま子に
+        // 継承すると lazygit が `terminal not cursor addressable` で落ちる。
+        // kanbario の surface は libghostty が描画する別 terminal なので、
+        // 親の TERM を継承する意味はなく、常に bundle 同梱の xterm-ghostty
+        // を使わせるのが正しい。
+        env["TERM"] = "xterm-ghostty"
+        // TERMINFO_DIRS: app bundle 内の terminfo を最優先で検索させる。
+        // system `/usr/share/terminfo` と user `~/.terminfo` も fallback に
+        // 並べる (ssh 経由で別 terminfo ディレクトリを明示したい場合に備えて)。
+        env["TERMINFO_DIRS"] = bundledTerminfoSearchPath(fallback: env["TERMINFO_DIRS"])
         // GUI-launched apps inherit launchd's thin PATH; prepend the user-local
         // bin locations so Claude Code's node-backed hooks / MCP clients work.
         env["PATH"] = augmentedPATH(current: env["PATH"])
@@ -80,14 +91,30 @@ enum ClaudeSessionFactory {
         // - initial_input also changes UX: it behaves like the user typed the
         //   prompt and is waiting to press Enter, not like `claude "body"`
         //   which executes immediately.
-        // Instead: let ghostty's `.shell` command mode hand the string to
-        //   /bin/sh -c, with task.body shell-quoted.
-        let commandLine: String
+        //
+        // ユーザの .zprofile / .zshenv で定義された PATH や環境変数
+        // (mise / asdf / direnv / API key など) を claude から見えるように
+        // するため、**login shell** (-l) 経由で起動する。
+        //
+        //   sh -c → $SHELL -l -c 'exec <claude ...>'
+        //
+        // - -l: login shell → .zprofile / .zshenv / /etc/zprofile を読ませる
+        // - -i は **意図的に外している**: interactive shell は PS1 を描画し、
+        //   job control を enable し、readline モードに TTY を持っていくので
+        //   直後の exec claude と競合して「入力できない」「ターミナルが止まる」
+        //   などの不安定を引き起こす (cmux も surface command では interactive
+        //   shell を直接起動しない)。.zshrc が読めない分は、ClaudeSessionFactory
+        //   の augmentedPATH が mise/asdf 等の shim パスを補填している。
+        // - exec: claude で shell を置換して PID を 1 段減らし、Stop ボタンの
+        //   SIGHUP 伝播経路を変えない
+        let claudeInvocation: String
         if task.body.isEmpty {
-            commandLine = shellQuote(executable.path)
+            claudeInvocation = shellQuote(executable.path)
         } else {
-            commandLine = "\(shellQuote(executable.path)) \(shellQuote(task.body))"
+            claudeInvocation = "\(shellQuote(executable.path)) \(shellQuote(task.body))"
         }
+        let userShell = env["SHELL"] ?? "/bin/zsh"
+        let commandLine = "\(shellQuote(userShell)) -l -c \(shellQuote("exec " + claudeInvocation))"
 
         return TerminalSurface(
             id: task.id,
@@ -166,6 +193,33 @@ enum ClaudeSessionFactory {
         return ordered.joined(separator: ":")
     }
 
+    /// 子プロセス用の `TERMINFO_DIRS` を構築する。
+    /// 優先順: app bundle 同梱の terminfo → user `~/.terminfo` →
+    /// system `/usr/share/terminfo` → 呼び出し側が既に持っていた fallback。
+    /// 先頭に来たパスが最優先なので、bundle 同梱の xterm-ghostty が
+    /// 確実に引かれる。
+    static func bundledTerminfoSearchPath(fallback: String?) -> String {
+        var paths: [String] = []
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("terminfo").path,
+           FileManager.default.fileExists(atPath: bundled) {
+            paths.append(bundled)
+        }
+        let home = NSHomeDirectory()
+        let userTerminfo = "\(home)/.terminfo"
+        if FileManager.default.fileExists(atPath: userTerminfo) {
+            paths.append(userTerminfo)
+        }
+        paths.append("/usr/share/terminfo")
+        if let fallback, !fallback.isEmpty {
+            for segment in fallback.split(separator: ":").map(String.init)
+            where !paths.contains(segment) {
+                paths.append(segment)
+            }
+        }
+        return paths.joined(separator: ":")
+    }
+
     /// Look up an executable name from PATH + Homebrew fallbacks.
     static func locateExecutable(_ name: String) -> URL? {
         let envPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
@@ -183,5 +237,46 @@ enum ClaudeSessionFactory {
             }
         }
         return nil
+    }
+}
+
+// MARK: - ShellTabFactory
+
+/// expanded モード中に ⌘T で開く「普通のシェル」用の TerminalSurface を組み立てる。
+/// claude と違い task / worktree / hook には紐付かない — ユーザー作業専用スクラッチ。
+///
+/// - KANBARIO_SURFACE_ID / KANBARIO_HOOK_CLI_PATH は **敢えて設定しない**。
+///   shim の hook 注入が走ると kanbario CLI に意味不明 event が飛んできて
+///   Kanban のカラム遷移を誤爆させる可能性がある。
+/// - PATH / LANG / LC_CTYPE は claude 側と同じく augment する (user の
+///   .zshrc が読めるようにするが、PATH fallback が無いと .zshrc 自体に
+///   辿り着けないケースもあるため)。
+enum ShellTabFactory {
+    static func makeSurface(
+        id: UUID,
+        workingDirectory: String?
+    ) -> TerminalSurface {
+        var env = ProcessInfo.processInfo.environment
+        // TERM は常に強制 (理由は ClaudeSessionFactory 参照、TERM=dumb 継承回避)。
+        env["TERM"] = "xterm-ghostty"
+        env["TERMINFO_DIRS"] = ClaudeSessionFactory.bundledTerminfoSearchPath(
+            fallback: env["TERMINFO_DIRS"]
+        )
+        env["PATH"] = ClaudeSessionFactory.augmentedPATH(current: env["PATH"])
+        if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
+        if env["LC_CTYPE"] == nil { env["LC_CTYPE"] = "UTF-8" }
+
+        // login + interactive で .zprofile / .zshrc を読ませる。claude と
+        // 違って続くコマンドは無いので `-c` ではなく shell を素のまま走らせる。
+        let userShell = env["SHELL"] ?? "/bin/zsh"
+        let commandLine = "\(ClaudeSessionFactory.shellQuote(userShell)) -l -i"
+
+        return TerminalSurface(
+            id: id,
+            command: commandLine,
+            workingDirectory: workingDirectory,
+            initialInput: nil,
+            environment: env
+        )
     }
 }

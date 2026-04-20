@@ -27,6 +27,28 @@
 		};
 /* End PBXCopyFilesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		F281CAFE010000000000001A /* Copy Ghostty Terminfo */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy Ghostty Terminfo";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\n# Copy ghostty terminfo (xterm-ghostty + xterm-256color) into the app bundle.\n# scripts/ensure-ghosttykit.sh puts the real files at Resources/terminfo.\nSRC=\"${PROJECT_DIR}/Resources/terminfo\"\nDST=\"${TARGET_BUILD_DIR}/${WRAPPER_NAME}/Contents/Resources/terminfo\"\nif [ -d \"$SRC\" ]; then\n    rm -rf \"$DST\"\n    mkdir -p \"$DST\"\n    # rsync is more forgiving than cp in the Xcode sandbox and will happily\n    # traverse a source tree with mixed file/dir permissions.\n    /usr/bin/rsync -aL --delete \"$SRC/\" \"$DST/\"\n    echo \"Copied ghostty terminfo to $DST ($(ls \"$DST\" | wc -l | tr -d ' ') entries)\"\nelse\n    echo \"warning: $SRC not found; skipping terminfo copy\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXContainerItemProxy section */
 		F281B2012F93787E00856A2D /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -159,6 +181,7 @@
 				F281B1F02F93787C00856A2D /* Frameworks */,
 				F281B1F12F93787C00856A2D /* Resources */,
 				F281B4032F94900000856A2D /* Copy Hook Bin */,
+				F281CAFE010000000000001A /* Copy Ghostty Terminfo */,
 			);
 			buildRules = (
 			);
@@ -402,7 +425,7 @@
 				DEVELOPMENT_TEAM = 444539945L;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -466,7 +489,7 @@
 				DEVELOPMENT_TEAM = 444539945L;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
