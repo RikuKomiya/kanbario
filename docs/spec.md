@@ -607,15 +607,30 @@ exit(0)
 
 **Codable 型 `HookMessage` を main app と共有**するため、Shared module を Xcode で設定すると一元管理できる。
 
-### 6.3. 状態遷移ルール (確定版)
+### 6.3. 状態遷移ルール (確定版、2026-04-20 改訂)
 
-| Hook event | 効果 |
-|---|---|
-| `SessionStart` | `tasks.status = inProgress`, `sessions.activity = running` |
-| `UserPromptSubmit` | `sessions.activity = running` (needsInput をクリア) |
-| `PreToolUse` (async) | `sessions.activity = running` (claude が reasoning 中) |
-| `Stop` | `sessions.activity = needsInput` (ターン終了、UI に badge) |
-| `SessionEnd` | `tasks.status = review`, `sessions.activity = exited` |
+**Kanban カラムの意味論** (重要):
+
+- `inProgress` = claude が**能動的に作業中** (tool 実行 / reasoning)
+- `review` = claude のターンが終わって**ユーザー入力待ち** (cmux における "needsInput") もしくは claude プロセス exit 後の停止状態
+- `done` = ユーザーが完了とした (手動 drag、cleanup 発火)
+
+つまり 1 つのタスクは hook が来るたびに `inProgress ↔ review` を行き来する
+(ユーザーが claude にメッセージを送れば inProgress、claude のターンが終われば
+review)。`canTransition` は両方向を許可済み。
+
+| Hook event | tasks.status | activitiesByTaskID |
+|---|---|---|
+| `SessionStart` | `inProgress` (planning なら前進、それ以外は idempotent) | `running` |
+| `UserPromptSubmit` | `inProgress` (review からの再開を含む) | `running` |
+| `PreToolUse` (async) | `inProgress` (idempotent) | `running` |
+| `Stop` | `review` (inProgress → review、それ以外は触らない) | `needsInput` |
+| `SessionEnd` | `review` (close_surface_cb 経路と冗長、idempotent) | (削除) |
+| `Notification` | (no-op) | (no-op) |
+
+`activitiesByTaskID` は `inProgress` カラム内で「claude が今何をしているか」
+の細粒度バッジに使う想定 (running の中で reasoning か tool 実行か等)。
+status とほぼ冗長になるが、UI で細かい表示が必要になった時の保険として保持。
 
 `review → done` はユーザーの drag で発火、cleanup は UI 側で:
 ```swift

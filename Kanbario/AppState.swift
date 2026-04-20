@@ -207,45 +207,74 @@ final class AppState {
     // MARK: - Hook receiver
 
     /// Claude shim → CLI → socket → ここ (MainActor) の経路で event を受ける。
-    /// spec.md §6.3 の状態遷移ルールを厳守。startTask の同期遷移と冗長化する
-    /// 設計なので、ここでは「同じ状態への idempotent な書き込み」になる event
-    /// が多い (session-start / session-end など)。
+    ///
+    /// Kanban のカラム意味論:
+    ///   - inProgress = claude が能動的に作業中 (tool 実行 / reasoning)
+    ///   - review     = claude のターンが終わってユーザー入力待ち (cmux の "needsInput")
+    ///                  または claude プロセスが exit して再開不可
+    ///   - done       = ユーザーが完了とした (手動 drag、cleanup 発火)
+    ///
+    /// したがって claude が動くたびにカードが inProgress ↔ review を行き来する。
+    /// state machine (canTransition) は両方向を既に許可しているので、ここでは
+    /// hook event を素直にカラム遷移へマッピングする。
     func handleHook(_ message: HookMessage) {
         guard let id = UUID(uuidString: message.surfaceID) else { return }
+        guard let idx = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let current = tasks[idx].status
 
         switch message.event {
         case "session-start":
-            // startTask が既に inProgress に飛ばしているので状態遷移は不要。
-            // activity を running に確定させ、UI バッジを最新化する。
+            // startTask が既に planning → inProgress に飛ばしているはず。
+            // 念のため planning に居る場合だけ前進させる (kanbario 外で同じ
+            // shim 設定を踏んだ場合の保護)。
+            if current == .planning {
+                applyStatusFromHook(idx: idx, to: .inProgress)
+            }
             activitiesByTaskID[id] = .running
 
         case "prompt-submit", "pre-tool-use":
-            // ユーザー入力 / tool 実行で needsInput をクリアし running へ。
+            // ユーザー入力 or tool 実行 = claude が能動的に動いている。
+            // review (= ユーザー待ち) からの「再開」を含めて inProgress へ。
+            if current == .review || current == .planning {
+                applyStatusFromHook(idx: idx, to: .inProgress)
+            }
             activitiesByTaskID[id] = .running
 
         case "stop":
-            // claude のターン終了 = 次のユーザー入力待ち。バッジ表示用。
+            // ターン終了 = claude が「次のユーザー入力を待っています」状態。
+            // Kanban 上で見える状態遷移として review カラムへ移す。
+            // done に到達済 (ユーザーが先に完了とした) なら触らない。
+            if current == .inProgress {
+                applyStatusFromHook(idx: idx, to: .review)
+            }
             activitiesByTaskID[id] = .needsInput
 
         case "session-end":
-            // claude プロセス exit。close_surface_cb と冗長化されるので、
-            // 既に review/done なら何もしない (idempotent)。
-            activitiesByTaskID.removeValue(forKey: id)
-            if let idx = tasks.firstIndex(where: { $0.id == id }),
-               tasks[idx].status == .inProgress {
-                tasks[idx].status = .review
-                tasks[idx].updatedAt = Date()
-                save()
+            // claude プロセス exit。close_surface_cb 経路と冗長 (どちらか
+            // 早い方で review に飛ばせば良い)。activity は exit を意味する
+            // 専用値が無いので消してしまう (= UI からは review 静止状態)。
+            if current == .inProgress {
+                applyStatusFromHook(idx: idx, to: .review)
             }
+            activitiesByTaskID.removeValue(forKey: id)
 
         case "notification":
             // MVP では未対応 (UNUserNotificationCenter は entitlement が要るため
-            // 後回し)。badge での needsInput 表示で十分カバーできる。
+            // 後回し)。Stop による review カラム遷移が「ユーザーの番」を
+            // ボード上で表現するので、最低限の可視化はカバーできている。
             break
 
         default:
             break
         }
+    }
+
+    /// hook 経由の status 書き換えは canTransition チェックを通さない
+    /// (hook は authoritative)。idx は呼び出し側で resolve 済み前提。
+    private func applyStatusFromHook(idx: Int, to status: TaskStatus) {
+        tasks[idx].status = status
+        tasks[idx].updatedAt = Date()
+        save()
     }
 
     private func startHookReceiver() {
