@@ -8,7 +8,24 @@
 
 /* Begin PBXBuildFile section */
 		F281B25A2F94025200856A2D /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F281B2592F94025200856A2D /* GhosttyKit.xcframework */; };
+		F281B4012F94900000856A2D /* claude in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B4002F94900000856A2D /* claude */; };
+		F281B4022F94900000856A2D /* kanbario in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B3042F94800000856A2D /* kanbario */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 /* End PBXBuildFile section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		F281B4032F94900000856A2D /* Copy Hook Bin */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = bin;
+			dstSubfolderSpec = 7;
+			files = (
+				F281B4012F94900000856A2D /* claude in Copy Hook Bin */,
+				F281B4022F94900000856A2D /* kanbario in Copy Hook Bin */,
+			);
+			name = "Copy Hook Bin";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXContainerItemProxy section */
 		F281B2012F93787E00856A2D /* PBXContainerItemProxy */ = {
@@ -25,6 +42,13 @@
 			remoteGlobalIDString = F281B1F22F93787C00856A2D;
 			remoteInfo = Kanbario;
 		};
+		F281B4052F94900000856A2D /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = F281B1EB2F93787C00856A2D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = F281B3002F94800000856A2D;
+			remoteInfo = KanbarioCLI;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +56,8 @@
 		F281B2002F93787E00856A2D /* KanbarioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KanbarioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F281B20A2F93787F00856A2D /* KanbarioUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KanbarioUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F281B2592F94025200856A2D /* GhosttyKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = GhosttyKit.xcframework; sourceTree = SOURCE_ROOT; };
+		F281B3042F94800000856A2D /* kanbario */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = kanbario; sourceTree = BUILT_PRODUCTS_DIR; };
+		F281B4002F94900000856A2D /* claude */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.sh; path = "Resources/bin/claude"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -48,6 +74,11 @@
 		F281B20D2F93787F00856A2D /* KanbarioUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = KanbarioUITests;
+			sourceTree = "<group>";
+		};
+		F281B3032F94800000856A2D /* CLI */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = CLI;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -75,6 +106,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F281B3022F94800000856A2D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -82,6 +120,8 @@
 			isa = PBXGroup;
 			children = (
 				F281B1F52F93787C00856A2D /* Kanbario */,
+				F281B3032F94800000856A2D /* CLI */,
+				F281B4002F94900000856A2D /* claude */,
 				F281B2032F93787E00856A2D /* KanbarioTests */,
 				F281B20D2F93787F00856A2D /* KanbarioUITests */,
 				F281B2582F94025200856A2D /* Frameworks */,
@@ -93,6 +133,7 @@
 			isa = PBXGroup;
 			children = (
 				F281B1F32F93787C00856A2D /* Kanbario.app */,
+				F281B3042F94800000856A2D /* kanbario */,
 				F281B2002F93787E00856A2D /* KanbarioTests.xctest */,
 				F281B20A2F93787F00856A2D /* KanbarioUITests.xctest */,
 			);
@@ -117,10 +158,12 @@
 				F281B1EF2F93787C00856A2D /* Sources */,
 				F281B1F02F93787C00856A2D /* Frameworks */,
 				F281B1F12F93787C00856A2D /* Resources */,
+				F281B4032F94900000856A2D /* Copy Hook Bin */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				F281B4042F94900000856A2D /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				F281B1F52F93787C00856A2D /* Kanbario */,
@@ -178,6 +221,27 @@
 			productReference = F281B20A2F93787F00856A2D /* KanbarioUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		F281B3002F94800000856A2D /* KanbarioCLI */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F281B3072F94800000856A2D /* Build configuration list for PBXNativeTarget "KanbarioCLI" */;
+			buildPhases = (
+				F281B3012F94800000856A2D /* Sources */,
+				F281B3022F94800000856A2D /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				F281B3032F94800000856A2D /* CLI */,
+			);
+			name = KanbarioCLI;
+			packageProductDependencies = (
+			);
+			productName = KanbarioCLI;
+			productReference = F281B3042F94800000856A2D /* kanbario */;
+			productType = "com.apple.product-type.tool";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -199,6 +263,9 @@
 						CreatedOnToolsVersion = 26.2;
 						TestTargetID = F281B1F22F93787C00856A2D;
 					};
+					F281B3002F94800000856A2D = {
+						CreatedOnToolsVersion = 26.2;
+					};
 				};
 			};
 			buildConfigurationList = F281B1EE2F93787C00856A2D /* Build configuration list for PBXProject "Kanbario" */;
@@ -216,6 +283,7 @@
 			projectRoot = "";
 			targets = (
 				F281B1F22F93787C00856A2D /* Kanbario */,
+				F281B3002F94800000856A2D /* KanbarioCLI */,
 				F281B1FF2F93787E00856A2D /* KanbarioTests */,
 				F281B2092F93787F00856A2D /* KanbarioUITests */,
 			);
@@ -268,6 +336,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		F281B3012F94800000856A2D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -280,6 +355,11 @@
 			isa = PBXTargetDependency;
 			target = F281B1F22F93787C00856A2D /* Kanbario */;
 			targetProxy = F281B20B2F93787F00856A2D /* PBXContainerItemProxy */;
+		};
+		F281B4042F94900000856A2D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = F281B3002F94800000856A2D /* kanbario */;
+			targetProxy = F281B4052F94900000856A2D /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -574,6 +654,36 @@
 			};
 			name = Release;
 		};
+		F281B3052F94800000856A2D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 444539945L;
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				PRODUCT_NAME = kanbario;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		F281B3062F94800000856A2D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 444539945L;
+				ENABLE_HARDENED_RUNTIME = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				PRODUCT_NAME = kanbario;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -609,6 +719,15 @@
 			buildConfigurations = (
 				F281B21B2F93787F00856A2D /* Debug */,
 				F281B21C2F93787F00856A2D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F281B3072F94800000856A2D /* Build configuration list for PBXNativeTarget "KanbarioCLI" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F281B3052F94800000856A2D /* Debug */,
+				F281B3062F94800000856A2D /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

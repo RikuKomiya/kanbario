@@ -29,9 +29,18 @@ enum ClaudeSessionFactory {
         worktreeURL: URL,
         claudeExecutable: URL? = nil
     ) throws -> TerminalSurface {
+        // Bundle 同梱の shim (Resources/bin/claude) を最優先で起動する。
+        // shim が --settings で hook を注入し、内部で real claude を exec
+        // する設計 (cmux 流。spec.md §6.1)。
+        // claudeExecutable 引数は test/CLI 上書き、locateExecutable は
+        // Bundle なしで起動された場合 (xcodebuild test 等) のフォールバック。
         let executable: URL
         if let explicit = claudeExecutable {
             executable = explicit
+        } else if let shim = Bundle.main.url(
+            forResource: "claude", withExtension: nil, subdirectory: "bin"
+        ), FileManager.default.isExecutableFile(atPath: shim.path) {
+            executable = shim
         } else if let found = locateExecutable("claude") {
             executable = found
         } else {
@@ -42,6 +51,15 @@ enum ClaudeSessionFactory {
         var env = ProcessInfo.processInfo.environment
         env["KANBARIO_SURFACE_ID"] = task.id.uuidString
         env["KANBARIO_TASK_ID"] = task.id.uuidString
+        env["KANBARIO_SOCKET_PATH"] = AppState.defaultHookSocketPath()
+        // shim が --settings JSON を組み立てる際、hook command として
+        // この絶対パスを埋め込む。Bundle 外で動かすときは "kanbario" を
+        // PATH 解決させるため未設定のまま (shim 側でフォールバック)。
+        if let cli = Bundle.main.url(
+            forResource: "kanbario", withExtension: nil, subdirectory: "bin"
+        ) {
+            env["KANBARIO_HOOK_CLI_PATH"] = cli.path
+        }
         env["TERM"] = env["TERM"] ?? "xterm-256color"
         // GUI-launched apps inherit launchd's thin PATH; prepend the user-local
         // bin locations so Claude Code's node-backed hooks / MCP clients work.

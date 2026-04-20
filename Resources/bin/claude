@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# kanbario claude wrapper — inject hook settings before exec'ing real claude.
+#
+# When KANBARIO_SURFACE_ID is set, this script is being invoked from inside
+# kanbario's terminal surface. We rebuild Claude Code's invocation with
+# `--settings` containing inline hooks JSON that fires `kanbario claude-hook
+# <event>` on every Claude lifecycle event.
+#
+# When KANBARIO_SURFACE_ID is unset (e.g. user happens to have this bundle's
+# bin/ on their PATH), we transparently pass through to the real claude.
+
+set -u
+
+find_real_claude() {
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+    local IFS=:
+    for d in $PATH; do
+        [[ "$d" == "$self_dir" ]] && continue
+        [[ -x "$d/claude" ]] && printf '%s' "$d/claude" && return 0
+    done
+    return 1
+}
+
+if [[ -z "${KANBARIO_SURFACE_ID:-}" ]]; then
+    REAL_CLAUDE="$(find_real_claude)" || { echo "claude: real binary not found in PATH" >&2; exit 127; }
+    exec "$REAL_CLAUDE" "$@"
+fi
+
+# Inside kanbario: build hooks JSON and inject via --settings.
+# HOOK_CLI is the absolute path to the bundled `kanbario` CLI (set by
+# ClaudeSessionFactory). Fallback to PATH lookup keeps debugging easy.
+HOOK_CLI="${KANBARIO_HOOK_CLI_PATH:-kanbario}"
+
+HOOKS_JSON="$(cat <<EOF
+{
+  "hooks": {
+    "SessionStart":     [{"hooks":[{"type":"command","command":"\"$HOOK_CLI\" claude-hook session-start","timeout":10}]}],
+    "Stop":             [{"hooks":[{"type":"command","command":"\"$HOOK_CLI\" claude-hook stop","timeout":10}]}],
+    "SessionEnd":       [{"hooks":[{"type":"command","command":"\"$HOOK_CLI\" claude-hook session-end","timeout":5}]}],
+    "UserPromptSubmit": [{"hooks":[{"type":"command","command":"\"$HOOK_CLI\" claude-hook prompt-submit","timeout":10}]}],
+    "PreToolUse":       [{"hooks":[{"type":"command","command":"\"$HOOK_CLI\" claude-hook pre-tool-use","timeout":5,"async":true}]}],
+    "Notification":     [{"hooks":[{"type":"command","command":"\"$HOOK_CLI\" claude-hook notification","timeout":5}]}]
+  }
+}
+EOF
+)"
+
+REAL_CLAUDE="$(find_real_claude)" || { echo "claude: real binary not found in PATH" >&2; exit 127; }
+exec "$REAL_CLAUDE" --settings "$HOOKS_JSON" "$@"

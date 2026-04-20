@@ -29,6 +29,10 @@ final class AppState {
     /// stdout の吸い出し・ログ蓄積はやらない — libghostty が GPU に描画する)。
     var activeSurfaces: [UUID: TerminalSurface] = [:]
 
+    /// Claude hook で受け取った活動状態。surface が消えれば nil に戻す。
+    /// 詳細画面のバッジ表示用 (Models.swift の `ClaudeActivity` 参照)。
+    var activitiesByTaskID: [UUID: ClaudeActivity] = [:]
+
     /// デモ用のデフォルトプロジェクト。MVP は 1 プロジェクト前提。
     let defaultProject: Project
 
@@ -37,6 +41,10 @@ final class AppState {
 
     /// 永続化先 (テストから差し替え可能)。
     private let saveURL: URL
+
+    /// Claude CLI からの hook を Unix socket で受ける常駐 listener。
+    /// init で立ち上がり、deinit で stop する。
+    private var hookReceiver: HookReceiver?
 
     init(saveURL: URL? = nil) {
         self.saveURL = saveURL ?? Self.defaultSaveURL()
@@ -57,6 +65,11 @@ final class AppState {
         if !repoPath.isEmpty {
             configureWorktreeService()
         }
+        startHookReceiver()
+    }
+
+    deinit {
+        hookReceiver?.stop()
     }
 
     // MARK: - Queries
@@ -187,7 +200,104 @@ final class AppState {
     func handleSurfaceClosed(taskID: UUID) {
         guard activeSurfaces[taskID] != nil else { return }
         activeSurfaces.removeValue(forKey: taskID)
+        activitiesByTaskID.removeValue(forKey: taskID)
         applyStatus(id: taskID, to: .review)
+    }
+
+    // MARK: - Hook receiver
+
+    /// Claude shim → CLI → socket → ここ (MainActor) の経路で event を受ける。
+    ///
+    /// Kanban のカラム意味論:
+    ///   - inProgress = claude が能動的に作業中 (tool 実行 / reasoning)
+    ///   - review     = claude のターンが終わってユーザー入力待ち (cmux の "needsInput")
+    ///                  または claude プロセスが exit して再開不可
+    ///   - done       = ユーザーが完了とした (手動 drag、cleanup 発火)
+    ///
+    /// したがって claude が動くたびにカードが inProgress ↔ review を行き来する。
+    /// state machine (canTransition) は両方向を既に許可しているので、ここでは
+    /// hook event を素直にカラム遷移へマッピングする。
+    func handleHook(_ message: HookMessage) {
+        guard let id = UUID(uuidString: message.surfaceID) else { return }
+        guard let idx = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let current = tasks[idx].status
+
+        switch message.event {
+        case "session-start":
+            // startTask が既に planning → inProgress に飛ばしているはず。
+            // 念のため planning に居る場合だけ前進させる (kanbario 外で同じ
+            // shim 設定を踏んだ場合の保護)。
+            if current == .planning {
+                applyStatusFromHook(idx: idx, to: .inProgress)
+            }
+            activitiesByTaskID[id] = .running
+
+        case "prompt-submit", "pre-tool-use":
+            // ユーザー入力 or tool 実行 = claude が能動的に動いている。
+            // review (= ユーザー待ち) からの「再開」を含めて inProgress へ。
+            if current == .review || current == .planning {
+                applyStatusFromHook(idx: idx, to: .inProgress)
+            }
+            activitiesByTaskID[id] = .running
+
+        case "stop":
+            // ターン終了 = claude が「次のユーザー入力を待っています」状態。
+            // Kanban 上で見える状態遷移として review カラムへ移す。
+            // done に到達済 (ユーザーが先に完了とした) なら触らない。
+            if current == .inProgress {
+                applyStatusFromHook(idx: idx, to: .review)
+            }
+            activitiesByTaskID[id] = .needsInput
+
+        case "session-end":
+            // claude プロセス exit。close_surface_cb 経路と冗長 (どちらか
+            // 早い方で review に飛ばせば良い)。activity は exit を意味する
+            // 専用値が無いので消してしまう (= UI からは review 静止状態)。
+            if current == .inProgress {
+                applyStatusFromHook(idx: idx, to: .review)
+            }
+            activitiesByTaskID.removeValue(forKey: id)
+
+        case "notification":
+            // MVP では未対応 (UNUserNotificationCenter は entitlement が要るため
+            // 後回し)。Stop による review カラム遷移が「ユーザーの番」を
+            // ボード上で表現するので、最低限の可視化はカバーできている。
+            break
+
+        default:
+            break
+        }
+    }
+
+    /// hook 経由の status 書き換えは canTransition チェックを通さない
+    /// (hook は authoritative)。idx は呼び出し側で resolve 済み前提。
+    private func applyStatusFromHook(idx: Int, to status: TaskStatus) {
+        tasks[idx].status = status
+        tasks[idx].updatedAt = Date()
+        save()
+    }
+
+    private func startHookReceiver() {
+        let socketPath = Self.defaultHookSocketPath()
+        let receiver = HookReceiver(socketPath: socketPath) { [weak self] message in
+            Task { @MainActor in
+                self?.handleHook(message)
+            }
+        }
+        do {
+            try receiver.start()
+            hookReceiver = receiver
+        } catch {
+            lastError = "HookReceiver start failed: \(error)"
+        }
+    }
+
+    /// CLI と app の両方が参照する socket path。Application Support 配下。
+    static func defaultHookSocketPath() -> String {
+        defaultSaveURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("hook.sock")
+            .path
     }
 
     /// review → done drag で呼ばれる。surface teardown → wt remove → done へ遷移。
@@ -200,6 +310,7 @@ final class AppState {
                 surface.teardown()
             }
             activeSurfaces.removeValue(forKey: task.id)
+            activitiesByTaskID.removeValue(forKey: task.id)
         }
 
         if let wt = worktreeService {
