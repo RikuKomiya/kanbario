@@ -50,6 +50,16 @@ enum TaskStatus: String, CaseIterable, Codable {
     }
 }
 
+// MARK: - ClaudeActivity
+
+/// 詳細画面のバッジ表現に使う、claude セッションの即時状態。
+/// hook event を受けて AppState.activitiesByTaskID にだけ載せる
+/// (TaskCard には永続化しない — process が死ねば意味がないので)。
+enum ClaudeActivity: String {
+    case running     // tool 実行中 / prompt 受領直後
+    case needsInput  // Stop hook = ターン終了、ユーザー入力待ち
+}
+
 // MARK: - Project
 
 struct Project: Identifiable, Codable, Hashable {

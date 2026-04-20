@@ -29,6 +29,10 @@ final class AppState {
     /// stdout の吸い出し・ログ蓄積はやらない — libghostty が GPU に描画する)。
     var activeSurfaces: [UUID: TerminalSurface] = [:]
 
+    /// Claude hook で受け取った活動状態。surface が消えれば nil に戻す。
+    /// 詳細画面のバッジ表示用 (Models.swift の `ClaudeActivity` 参照)。
+    var activitiesByTaskID: [UUID: ClaudeActivity] = [:]
+
     /// デモ用のデフォルトプロジェクト。MVP は 1 プロジェクト前提。
     let defaultProject: Project
 
@@ -37,6 +41,10 @@ final class AppState {
 
     /// 永続化先 (テストから差し替え可能)。
     private let saveURL: URL
+
+    /// Claude CLI からの hook を Unix socket で受ける常駐 listener。
+    /// init で立ち上がり、deinit で stop する。
+    private var hookReceiver: HookReceiver?
 
     init(saveURL: URL? = nil) {
         self.saveURL = saveURL ?? Self.defaultSaveURL()
@@ -57,6 +65,11 @@ final class AppState {
         if !repoPath.isEmpty {
             configureWorktreeService()
         }
+        startHookReceiver()
+    }
+
+    deinit {
+        hookReceiver?.stop()
     }
 
     // MARK: - Queries
@@ -187,7 +200,75 @@ final class AppState {
     func handleSurfaceClosed(taskID: UUID) {
         guard activeSurfaces[taskID] != nil else { return }
         activeSurfaces.removeValue(forKey: taskID)
+        activitiesByTaskID.removeValue(forKey: taskID)
         applyStatus(id: taskID, to: .review)
+    }
+
+    // MARK: - Hook receiver
+
+    /// Claude shim → CLI → socket → ここ (MainActor) の経路で event を受ける。
+    /// spec.md §6.3 の状態遷移ルールを厳守。startTask の同期遷移と冗長化する
+    /// 設計なので、ここでは「同じ状態への idempotent な書き込み」になる event
+    /// が多い (session-start / session-end など)。
+    func handleHook(_ message: HookMessage) {
+        guard let id = UUID(uuidString: message.surfaceID) else { return }
+
+        switch message.event {
+        case "session-start":
+            // startTask が既に inProgress に飛ばしているので状態遷移は不要。
+            // activity を running に確定させ、UI バッジを最新化する。
+            activitiesByTaskID[id] = .running
+
+        case "prompt-submit", "pre-tool-use":
+            // ユーザー入力 / tool 実行で needsInput をクリアし running へ。
+            activitiesByTaskID[id] = .running
+
+        case "stop":
+            // claude のターン終了 = 次のユーザー入力待ち。バッジ表示用。
+            activitiesByTaskID[id] = .needsInput
+
+        case "session-end":
+            // claude プロセス exit。close_surface_cb と冗長化されるので、
+            // 既に review/done なら何もしない (idempotent)。
+            activitiesByTaskID.removeValue(forKey: id)
+            if let idx = tasks.firstIndex(where: { $0.id == id }),
+               tasks[idx].status == .inProgress {
+                tasks[idx].status = .review
+                tasks[idx].updatedAt = Date()
+                save()
+            }
+
+        case "notification":
+            // MVP では未対応 (UNUserNotificationCenter は entitlement が要るため
+            // 後回し)。badge での needsInput 表示で十分カバーできる。
+            break
+
+        default:
+            break
+        }
+    }
+
+    private func startHookReceiver() {
+        let socketPath = Self.defaultHookSocketPath()
+        let receiver = HookReceiver(socketPath: socketPath) { [weak self] message in
+            Task { @MainActor in
+                self?.handleHook(message)
+            }
+        }
+        do {
+            try receiver.start()
+            hookReceiver = receiver
+        } catch {
+            lastError = "HookReceiver start failed: \(error)"
+        }
+    }
+
+    /// CLI と app の両方が参照する socket path。Application Support 配下。
+    static func defaultHookSocketPath() -> String {
+        defaultSaveURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("hook.sock")
+            .path
     }
 
     /// review → done drag で呼ばれる。surface teardown → wt remove → done へ遷移。
@@ -200,6 +281,7 @@ final class AppState {
                 surface.teardown()
             }
             activeSurfaces.removeValue(forKey: task.id)
+            activitiesByTaskID.removeValue(forKey: task.id)
         }
 
         if let wt = worktreeService {
