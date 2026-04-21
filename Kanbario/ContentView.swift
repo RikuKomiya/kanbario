@@ -7,13 +7,26 @@ struct ContentView: View {
 
     var body: some View {
         HSplitView {
+            // expanded の間は KanbanBoardView を HSplitView から物理的に外さず、
+            // frame 0 に潰して `.hidden()` で描画コストも切る。子配列の数を
+            // 変えると HSplitView が identity を再計算し、TaskDetailView ごと
+            // dismantle されて libghostty NSView が解放され claude が殺される
+            // (PR #4 と同じ経路の罠)。identity を維持するために「幅 0 の非表示」
+            // として残すのがポイント。
             KanbanBoardView()
-                .frame(minWidth: 760, idealWidth: 960)
+                .frame(
+                    minWidth: appState.isTerminalExpanded ? 0 : 760,
+                    idealWidth: appState.isTerminalExpanded ? 0 : 960,
+                    maxWidth: appState.isTerminalExpanded ? 0 : .infinity
+                )
+                .opacity(appState.isTerminalExpanded ? 0 : 1)
+                .allowsHitTesting(!appState.isTerminalExpanded)
             TaskDetailView()
-                .frame(minWidth: 300, idealWidth: 360)
-                .frame(maxWidth: 520)
+                .frame(minWidth: 300, idealWidth: appState.isTerminalExpanded ? 960 : 360)
+                .frame(maxWidth: appState.isTerminalExpanded ? .infinity : 520)
         }
         .frame(minWidth: 1060, minHeight: 580)
+        .animation(.smooth(duration: 0.22), value: appState.isTerminalExpanded)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 repoChip

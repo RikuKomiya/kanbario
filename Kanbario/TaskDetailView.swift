@@ -10,6 +10,12 @@ struct TaskDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // expanded 時は detail (title / metadata / body / Start ボタン) を
+            // 高さ 0 に潰して隠すだけ。`if !expanded` で conditional mount
+            // すると VStack の子配列の要素数が変わり、terminalArea の identity
+            // (そこに居る libghostty NSView) が SwiftUI に「別物」と判断されて
+            // dismantle されるリスクがある。detail 側には NSView はないので
+            // 安全に消せる ― でも兄弟の terminalArea を守るため残す。
             Group {
                 if let task = appState.selectedTask {
                     detail(for: task)
@@ -21,12 +27,25 @@ struct TaskDetailView: View {
                     placeholder
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: appState.isTerminalExpanded ? 0 : .infinity)
+            .opacity(appState.isTerminalExpanded ? 0 : 1)
+            .allowsHitTesting(!appState.isTerminalExpanded)
+            .clipped()
 
             terminalArea
         }
         .background(Color(.windowBackgroundColor))
         .animation(.smooth(duration: 0.25), value: appState.selectedTaskID)
+        // ESC / Collapse ボタンと同じく、expanded モード中は Cmd+. でも戻せる。
+        .background(
+            Button("") {
+                if appState.isTerminalExpanded {
+                    appState.isTerminalExpanded = false
+                }
+            }
+            .keyboardShortcut(.cancelAction)
+            .hidden()
+        )
     }
 
     /// 全 active surface を常時マウントする terminal area。
@@ -43,23 +62,162 @@ struct TaskDetailView: View {
     /// `.allowsHitTesting(false)`。view identity が安定するので NSView は
     /// 「surface が本当に消える時」(Stop / hook close / done drag) だけ
     /// dismantle される正しい semantics になる。
+    /// 現在 terminalArea で表に見せる surface の ID。
+    /// - shell タブが選ばれていればその ID
+    /// - そうでなければ現在選択中タスクの ID (claude surface)
+    private var activeTerminalID: UUID? {
+        if let shell = appState.selectedTerminalID,
+           appState.shellSurfaces[shell] != nil {
+            return shell
+        }
+        return appState.selectedTaskID
+    }
+
     @ViewBuilder
     private var terminalArea: some View {
-        let activeIDs = Array(appState.activeSurfaces.keys)
-        if !activeIDs.isEmpty {
-            ZStack {
-                ForEach(activeIDs, id: \.self) { taskID in
-                    if let surface = appState.activeSurfaces[taskID],
-                       let task = appState.tasks.first(where: { $0.id == taskID }) {
-                        terminalPane(task: task, surface: surface)
-                            .opacity(taskID == appState.selectedTaskID ? 1 : 0)
-                            .allowsHitTesting(taskID == appState.selectedTaskID)
+        // `activeSurfaces.keys` は Swift Dictionary なので**順序非決定**。
+        // ForEach(id: \.self) に流し込むと、レンダリングのたびに順序がブレて
+        // SwiftUI の identity 追跡が破綻し、GhosttyNSView を dismantle してしまう
+        // (= claude 殺害)。tasks 配列の順序でフィルタして決定的に取り出す。
+        let taskIDs = appState.tasks.compactMap { task in
+            appState.activeSurfaces[task.id] != nil ? task.id : nil
+        }
+        let shellIDs = appState.shellTabOrder
+        if !taskIDs.isEmpty || !shellIDs.isEmpty {
+            VStack(spacing: 0) {
+                if appState.isTerminalExpanded {
+                    // expanded 中のみタブバーを出す。通常モードは従来どおり
+                    // タスクに紐付いた 1 surface を見せるだけなのでタブ不要。
+                    tabBar(taskIDs: taskIDs, shellIDs: shellIDs)
+                }
+
+                ZStack {
+                    // タスク surface (claude)
+                    ForEach(taskIDs, id: \.self) { taskID in
+                        if let surface = appState.activeSurfaces[taskID],
+                           let task = appState.tasks.first(where: { $0.id == taskID }) {
+                            terminalPane(task: task, surface: surface)
+                                .opacity(taskID == activeTerminalID ? 1 : 0)
+                                .allowsHitTesting(taskID == activeTerminalID)
+                        }
+                    }
+                    // shell タブ surface
+                    ForEach(shellIDs, id: \.self) { shellID in
+                        if let surface = appState.shellSurfaces[shellID] {
+                            shellTabPane(id: shellID, surface: surface)
+                                .opacity(shellID == activeTerminalID ? 1 : 0)
+                                .allowsHitTesting(shellID == activeTerminalID)
+                        }
                     }
                 }
             }
-            .frame(minHeight: 280, maxHeight: 520)
-            .padding([.horizontal, .bottom], 18)
+            .frame(
+                minHeight: 280,
+                maxHeight: appState.isTerminalExpanded ? .infinity : 520
+            )
+            .padding(
+                [.horizontal, .bottom],
+                appState.isTerminalExpanded ? 0 : 18
+            )
         }
+    }
+
+    /// expanded 中のみ表示されるタブバー。claude タスク (1 本) + shell タブ (0..n)
+    /// + 「+」(新規 shell タブ) が並ぶ。`⌘T` は新規タブボタンに keyboardShortcut
+    /// を仕込むことで expanded 中だけ active になる (disabled で通常モード時は
+    /// OS の default ⌘T に流す)。
+    @ViewBuilder
+    private func tabBar(taskIDs: [UUID], shellIDs: [UUID]) -> some View {
+        HStack(spacing: 4) {
+            // 選択中タスクの claude タブ (タスクが active の時だけ表示)
+            if let taskID = appState.selectedTaskID,
+               appState.activeSurfaces[taskID] != nil,
+               let task = appState.tasks.first(where: { $0.id == taskID }) {
+                tabButton(
+                    title: task.title,
+                    icon: "sparkles",
+                    isSelected: activeTerminalID == taskID,
+                    onSelect: { appState.selectedTerminalID = nil },
+                    onClose: nil
+                )
+            }
+
+            ForEach(Array(shellIDs.enumerated()), id: \.element) { index, shellID in
+                tabButton(
+                    title: "Shell \(index + 1)",
+                    icon: "terminal",
+                    isSelected: activeTerminalID == shellID,
+                    onSelect: { appState.selectedTerminalID = shellID },
+                    onClose: { appState.requestCloseShellTab(id: shellID) }
+                )
+            }
+
+            Button {
+                appState.openShellTab()
+            } label: {
+                Image(systemName: "plus")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .background(Color.secondary.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .keyboardShortcut("t", modifiers: .command)
+            .help("New shell tab (⌘T)")
+
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color(.windowBackgroundColor))
+    }
+
+    private func tabButton(
+        title: String,
+        icon: String,
+        isSelected: Bool,
+        onSelect: @escaping () -> Void,
+        onClose: (() -> Void)?
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.caption2)
+                .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+            Text(title)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 160, alignment: .leading)
+            if let onClose {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isSelected ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.08))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
+    }
+
+    /// shell タブ用の pane。claude と違ってヘッダに activity ラベルや Stop は要らない。
+    @ViewBuilder
+    private func shellTabPane(id: UUID, surface: TerminalSurface) -> some View {
+        GhosttyTerminalView(
+            terminalSurface: surface,
+            isSelected: id == activeTerminalID,
+            onCloseRequested: { _ in
+                appState.handleShellTabClosed(id: id)
+            }
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     private func detail(for task: TaskCard) -> some View {
@@ -195,6 +353,26 @@ struct TaskDetailView: View {
                     ActivityBadge(activity: activity)
                 }
                 Spacer()
+
+                // Expand / Collapse は同じスロット。expanded の時のみ選択中の
+                // タスクでアクティブにしたいので、hit test は selectedTask ==
+                // task.id を前提に effectively 1 つだけ働く (terminalArea の
+                // .allowsHitTesting と同じ理屈)。
+                Button {
+                    appState.isTerminalExpanded.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: appState.isTerminalExpanded
+                              ? "arrow.down.right.and.arrow.up.left"
+                              : "arrow.up.left.and.arrow.down.right")
+                        Text(appState.isTerminalExpanded ? "Collapse" : "Expand")
+                    }
+                }
+                .controlSize(.small)
+                .help(appState.isTerminalExpanded
+                      ? "ターミナルを通常サイズに戻す (ESC / ⌘.)"
+                      : "ターミナルを全画面で表示")
+
                 Button(role: .destructive) {
                     appState.stopTask(id: task.id)
                 } label: {
@@ -210,6 +388,7 @@ struct TaskDetailView: View {
             let taskID = task.id
             GhosttyTerminalView(
                 terminalSurface: surface,
+                isSelected: taskID == activeTerminalID,
                 onCloseRequested: { _ in
                     appState.handleSurfaceClosed(taskID: taskID)
                 }
