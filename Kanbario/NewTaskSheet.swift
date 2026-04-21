@@ -9,14 +9,22 @@ struct NewTaskSheet: View {
 
     @State private var title: String = ""
     @State private var bodyText: String = ""
+    @State private var branchInput: String = ""
     @State private var tag: LLMTag? = nil
     @State private var risk: RiskLevel? = nil
     @State private var owner: String = ""
     @State private var promptV: String = ""
     @State private var needsInput: String = ""   // カンマ区切り
 
+    /// ✨ AI ボタンで LLM branch 生成中の spinner フラグ。
+    @State private var isGeneratingBranch: Bool = false
+    /// 生成失敗時のフォーム内インライン表示 (alert 連打を避ける)。
+    @State private var branchGenerationError: String? = nil
+    /// 既存 branch picker 用のキャッシュ。sheet open 時に 1 回ロード。
+    @State private var availableBranches: [String] = []
+
     @FocusState private var focus: Field?
-    enum Field { case title, body, owner, promptV, needs }
+    enum Field { case title, body, branch, owner, promptV, needs }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -34,6 +42,8 @@ struct NewTaskSheet: View {
                 promptVField
             }
 
+            branchField
+
             needsField
 
             actionRow
@@ -45,6 +55,13 @@ struct NewTaskSheet: View {
         .tint(WF.ink)              // カーソル / selection も ink 色へ揃える
         .preferredColorScheme(.light)  // 紙色テーマは light 前提
         .onAppear { focus = .title }
+        .task {
+            // 既存 branch picker 用に repo の local branch 一覧を 1 回ロード。
+            // Sheet 表示中に branch が増えることは稀なので再ロード不要。
+            if let wt = appState.worktreeService {
+                availableBranches = await wt.allBranches()
+            }
+        }
     }
 
     // MARK: - Header
@@ -181,6 +198,129 @@ struct NewTaskSheet: View {
         }
     }
 
+    // MARK: - Branch name + AI generator
+
+    /// branch 名入力欄 + ✨ AI ボタン。空欄ならタスク作成時に
+    /// `kanbario/<uuid6>` が自動付与される (placeholder でその旨を示す)。
+    /// ✨ ボタンは title/body をプロンプトに Haiku 4.5 で slug を生成し、
+    /// 返ってきた値を入力欄に差し込む。生成中は spinner + disable。
+    private var branchField: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Hand("Branch name", size: 12, color: WF.ink2)
+                Spacer()
+                existingBranchMenu
+                aiGenerateButton
+            }
+            TextField("空欄で kanbario/<auto> · 例: kanbario/add-auth-tests",
+                      text: $branchInput)
+                .textFieldStyle(.plain)
+                .font(WFFont.mono(12))
+                .foregroundStyle(WF.ink)
+                .padding(8)
+                .background(WF.paperAlt, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(focus == .branch ? WF.accent : WF.line, lineWidth: 1.3)
+                )
+                .focused($focus, equals: .branch)
+            if let err = branchGenerationError {
+                Text(err)
+                    .font(WFFont.mono(10))
+                    .foregroundStyle(WF.pink)
+                    .lineLimit(2)
+            }
+        }
+    }
+
+    /// 📋 既存 branch ドロップダウン。repo の local branch 全部から選んで
+    /// input 欄に差し込む。選んだ branch に既存 worktree があれば Start 時に
+    /// 自動で attach、無ければ新規 worktree 作成。
+    @ViewBuilder
+    private var existingBranchMenu: some View {
+        Menu {
+            if availableBranches.isEmpty {
+                Button("(no branches)") { }
+                    .disabled(true)
+            } else {
+                ForEach(availableBranches, id: \.self) { b in
+                    Button {
+                        branchInput = b
+                    } label: {
+                        Text(b)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "list.bullet.indent")
+                    .font(.system(size: 11))
+                Text("Existing").font(WFFont.hand(11, weight: .bold))
+            }
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .foregroundStyle(WF.ink2)
+            .overlay(Capsule().stroke(WF.ink3.opacity(0.7), lineWidth: 1))
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("既存の branch から選択 (worktree が既にあれば attach、無ければ新規作成)")
+    }
+
+    /// ✨ Generate ボタン。title 空 or 生成中は disable。
+    /// タップで `BranchNameGenerator.generate` を呼んで branchInput に反映。
+    private var aiGenerateButton: some View {
+        Button {
+            Task { await generateBranchName() }
+        } label: {
+            HStack(spacing: 4) {
+                if isGeneratingBranch {
+                    ProgressView().controlSize(.mini).scaleEffect(0.6)
+                        .frame(width: 12, height: 12)
+                } else {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 11))
+                }
+                Text("AI").font(WFFont.hand(11, weight: .bold))
+            }
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .foregroundStyle(WF.accent)
+            .overlay(
+                Capsule().stroke(WF.accent.opacity(0.55), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isGeneratingBranch
+                  || title.trimmingCharacters(in: .whitespaces).isEmpty)
+        .opacity(
+            (isGeneratingBranch
+             || title.trimmingCharacters(in: .whitespaces).isEmpty) ? 0.4 : 1
+        )
+        .help(title.isEmpty
+              ? "先に Title を入力してください"
+              : "ローカルの claude CLI で branch 名を生成 (数秒〜十数秒)")
+    }
+
+    /// `claude -p` を subprocess で呼んで branch slug を取得し、input 欄に
+    /// `kanbario/<slug>` 形式で差し込む。API key は不要 — ユーザーが既に
+    /// claude CLI にログインしていれば動く。
+    ///
+    /// 失敗は全て GenerationError として throw されるので、メッセージを
+    /// フォーム内の薄い赤字に出す。alert 連打は避ける。
+    @MainActor
+    private func generateBranchName() async {
+        branchGenerationError = nil
+        isGeneratingBranch = true
+        defer { isGeneratingBranch = false }
+        do {
+            let slug = try await BranchNameGenerator.generate(
+                title: title, body: bodyText
+            )
+            branchInput = "kanbario/\(slug)"
+        } catch {
+            branchGenerationError = "生成失敗: \(error)"
+        }
+    }
+
     // MARK: - Needs
 
     private var needsField: some View {
@@ -215,6 +355,9 @@ struct NewTaskSheet: View {
                     appState.addTask(
                         title: title,
                         body: bodyText,
+                        branch: branchInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? nil
+                            : branchInput.trimmingCharacters(in: .whitespacesAndNewlines),
                         tag: tag,
                         risk: risk,
                         owner: owner.trimmingCharacters(in: .whitespaces).isEmpty

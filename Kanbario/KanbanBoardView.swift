@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreGraphics
 import UniformTypeIdentifiers
+import Combine  // ElapsedTimer の Timer.publish(...).autoconnect() で必要
 
 // Claude Design の Kanban Wireframes (mvp-board.jsx) を SwiftUI に移植したボード。
 // 紙色背景 + sketchy 黒枠 + 手書きフォントで wireframe 言語を踏襲している。
@@ -219,6 +220,7 @@ struct KanbanColumn: View {
                 task: task,
                 stage: status,
                 activity: appState.activitiesByTaskID[task.id],
+                permissionMessage: appState.pendingPermissionByTaskID[task.id],
                 isSelected: appState.selectedTaskID == task.id
             )
         }
@@ -271,6 +273,10 @@ struct MVPCard: View {
     let task: TaskCard
     let stage: TaskStatus
     var activity: ClaudeActivity? = nil
+    /// Claude Code が tool permission / approval を求めている時のメッセージ。
+    /// 非 nil の間は ActivityBadge を置き換えて PermissionBadge を表示する
+    /// (permission は緊急度が高いので上書き優先)。
+    var permissionMessage: String? = nil
     var isSelected: Bool = false
 
     @State private var isHovering = false
@@ -317,7 +323,14 @@ struct MVPCard: View {
                 WFPill(color: WF.ink3) { Text("untagged") }
             }
             Spacer()
-            if let activity { ActivityBadge(activity: activity) }
+            // 優先順: permission > activity。permission 中に activity も
+            // 並べると視線が分散するので、permission が来ている間は
+            // activity バッジは隠す。
+            if let permissionMessage {
+                PermissionBadge(message: permissionMessage)
+            } else if let activity {
+                ActivityBadge(activity: activity)
+            }
             if let risk = task.risk { RiskBadge(risk: risk) }
         }
     }
@@ -356,35 +369,43 @@ struct MVPCard: View {
                 }
             }
         case .inProgress:
-            if let eval = task.evalScore {
-                HStack(spacing: 14) {
-                    EvalMeter(score: eval, size: 32)
-                    VStack(alignment: .leading, spacing: 4) {
-                        if let runs = task.runs, let fails = task.fails {
-                            Metric(label: "runs / fails", value: "\(runs) / \(fails)")
+            VStack(alignment: .leading, spacing: 8) {
+                if let eval = task.evalScore {
+                    HStack(spacing: 14) {
+                        EvalMeter(score: eval, size: 32)
+                        VStack(alignment: .leading, spacing: 4) {
+                            if let runs = task.runs, let fails = task.fails {
+                                Metric(label: "runs / fails", value: "\(runs) / \(fails)")
+                            }
+                            if let cost = task.cost {
+                                Metric(label: "cost / call", value: String(format: "$%.3f", cost))
+                            }
                         }
-                        if let cost = task.cost {
-                            Metric(label: "cost / call", value: String(format: "$%.3f", cost))
-                        }
+                        Spacer()
                     }
-                    Spacer()
                 }
+                ActivityPanel(taskID: task.id)
+                LiveLogView(taskID: task.id)
             }
         case .review:
-            if let eval = task.evalScore {
-                HStack(spacing: 14) {
-                    EvalMeter(score: eval, size: 32)
-                    VStack(alignment: .leading, spacing: 4) {
-                        if let hr = task.humanReview {
-                            Metric(label: "human review", value: hr)
+            VStack(alignment: .leading, spacing: 8) {
+                if let eval = task.evalScore {
+                    HStack(spacing: 14) {
+                        EvalMeter(score: eval, size: 32)
+                        VStack(alignment: .leading, spacing: 4) {
+                            if let hr = task.humanReview {
+                                Metric(label: "human review", value: hr)
+                            }
+                            if let r = task.regressions {
+                                Metric(label: "regressions", value: String(r),
+                                       color: r > 0 ? WF.pink : WF.ink)
+                            }
                         }
-                        if let r = task.regressions {
-                            Metric(label: "regressions", value: String(r),
-                                   color: r > 0 ? WF.pink : WF.ink)
-                        }
+                        Spacer()
                     }
-                    Spacer()
                 }
+                ActivityPanel(taskID: task.id)
+                LiveLogView(taskID: task.id)
             }
         case .done:
             HStack(spacing: 14) {
@@ -480,6 +501,35 @@ struct KanbanColumnDropDelegate: DropDelegate {
     }
 }
 
+// MARK: - PermissionBadge
+
+/// Claude Code が tool permission / approval を要求している時にカード右上に
+/// 出す目立つバッジ。色は WF.pink (危険色) で、形は Capsule。詳細 message は
+/// hover tooltip で展開する (狭いカード内に長文を載せない設計)。
+///
+/// kanbario 自体は y/n を送る経路を持たないので、このバッジの役割は純粋に
+/// 「気づかせる」こと。ユーザーはバッジを見て該当タスクを開き、terminal 内で
+/// 承認する。
+struct PermissionBadge: View {
+    let message: String
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "hand.raised.fill")
+                .font(.system(size: 9, weight: .bold))
+            Text("Permission")
+                .font(WFFont.hand(10, weight: .bold))
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(WF.pink.opacity(0.18))
+        .foregroundStyle(WF.pink)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(WF.pink.opacity(0.55), lineWidth: 1))
+        .help(message)
+    }
+}
+
 // MARK: - ActivityBadge (kept from prior implementation)
 
 /// カード右上の claude 実時間バッジ。wireframe 本体には存在しないが、hook event を
@@ -517,6 +567,248 @@ struct ActivityBadge: View {
         switch activity {
         case .running:    return .blue
         case .needsInput: return .orange
+        }
+    }
+}
+
+// MARK: - ActivityPanel
+
+/// カード上で Claude の「今動いている感」を表示する。Claude Code のターミナル
+/// UI にある以下の要素を縮約再現:
+///   - 現在実行中の tool 名と引数 (+ spinner): `→ Fetch(https://...)`
+///   - TodoWrite で登録された現在進行中タスクと経過時間: `✳ Investigate… (1m 26s)`
+///   - TodoWrite 全体の chip リスト: `◼ done · ▸ doing · ◻ pending`
+///
+/// AppState.currentActivityByTaskID を source of truth にするので、tailer が
+/// transcript から拾った新情報は即描画される (Observable の auto-propagation)。
+struct ActivityPanel: View {
+    @Environment(AppState.self) private var appState
+    let taskID: UUID
+
+    var body: some View {
+        let permission = appState.pendingPermissionByTaskID[taskID]
+        let activity = appState.currentActivityByTaskID[taskID]
+        if permission != nil || (activity.map { hasContent($0) } ?? false) {
+            VStack(alignment: .leading, spacing: 4) {
+                if let permission {
+                    permissionRow(message: permission)
+                }
+                if let a = activity {
+                    if let tool = a.activeToolName {
+                        runningToolRow(name: tool,
+                                       inputSummary: a.activeToolInputSummary)
+                    }
+                    if let current = a.todos.first(where: { $0.status == "in_progress" }) {
+                        currentTodoRow(todo: current,
+                                       startedAt: a.turnStartedAt)
+                    }
+                    if !a.todos.isEmpty {
+                        todoListRow(todos: a.todos)
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(WF.paperAlt, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(permission != nil ? WF.pink.opacity(0.45) : WF.ink3.opacity(0.3),
+                            lineWidth: permission != nil ? 1.2 : 0.8)
+            )
+        }
+    }
+
+    private func hasContent(_ a: CurrentActivity) -> Bool {
+        a.activeToolName != nil || !a.todos.isEmpty
+    }
+
+    /// permission message を 1 行 bold + pink で強調表示。hover で全文 tooltip。
+    @ViewBuilder
+    private func permissionRow(message: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "hand.raised.fill")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(WF.pink)
+            Text(message)
+                .font(WFFont.mono(10))
+                .fontWeight(.bold)
+                .foregroundStyle(WF.pink)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer()
+        }
+        .help(message)
+    }
+
+    /// 実行中 tool 行。spinner (小さな Claude Code 風 ⎿) + tool 名 + 引数サマリ。
+    @ViewBuilder
+    private func runningToolRow(name: String, inputSummary: String?) -> some View {
+        HStack(spacing: 4) {
+            ProgressView()
+                .controlSize(.mini)
+                .scaleEffect(0.6)
+                .frame(width: 10, height: 10)
+            Text(name)
+                .font(WFFont.mono(10))
+                .fontWeight(.bold)
+                .foregroundStyle(WF.warn)
+            if let s = inputSummary {
+                Text(s)
+                    .font(WFFont.mono(10))
+                    .foregroundStyle(WF.ink2)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+        }
+    }
+
+    /// 現在進行中 todo 行。Claude Code の `✳ Investigate… (1m 26s)` を模倣。
+    @ViewBuilder
+    private func currentTodoRow(todo: TodoItem, startedAt: Date?) -> some View {
+        HStack(spacing: 4) {
+            Text("✳")
+                .font(.system(size: 10))
+                .foregroundStyle(WF.accent)
+            Text(todo.activeForm ?? todo.content)
+                .font(WFFont.mono(10))
+                .fontWeight(.bold)
+                .foregroundStyle(WF.ink)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let startedAt {
+                ElapsedTimer(startedAt: startedAt)
+            }
+            Spacer()
+        }
+    }
+
+    /// TodoWrite 全体の進捗表示。done count と最大 4 件の head list。
+    @ViewBuilder
+    private func todoListRow(todos: [TodoItem]) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ForEach(todos.prefix(5).indices, id: \.self) { i in
+                let t = todos[i]
+                HStack(spacing: 4) {
+                    Text(Self.mark(for: t.status))
+                        .font(WFFont.mono(9))
+                        .foregroundStyle(Self.color(for: t.status))
+                    Text(t.content)
+                        .font(WFFont.mono(9))
+                        .foregroundStyle(Self.color(for: t.status))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer()
+                }
+            }
+            if todos.count > 5 {
+                Text("+ \(todos.count - 5) more")
+                    .font(WFFont.mono(8))
+                    .foregroundStyle(WF.ink3)
+            }
+        }
+    }
+
+    private static func mark(for status: String) -> String {
+        switch status {
+        case "completed":   return "◼"
+        case "in_progress": return "▸"
+        default:            return "◻"
+        }
+    }
+
+    private static func color(for status: String) -> Color {
+        switch status {
+        case "completed":   return WF.done
+        case "in_progress": return WF.accent
+        default:            return WF.ink3
+        }
+    }
+}
+
+// MARK: - ElapsedTimer
+
+/// 経過時間を 1 秒間隔で更新する極小ビュー。"(1m 26s)" / "(23s)" 形式。
+/// Timer.publish は Card が画面外でも動き続けるため、大量の tasks がある
+/// 場合は負荷になる可能性あり。MVP では許容 (同時実行 task は数個想定)。
+struct ElapsedTimer: View {
+    let startedAt: Date
+    @State private var now = Date()
+
+    var body: some View {
+        Text(formatted)
+            .font(WFFont.mono(9))
+            .foregroundStyle(WF.ink3)
+            .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { t in
+                now = t
+            }
+    }
+
+    private var formatted: String {
+        let delta = max(0, Int(now.timeIntervalSince(startedAt)))
+        let m = delta / 60
+        let s = delta % 60
+        return m > 0 ? "(\(m)m \(s)s)" : "(\(s)s)"
+    }
+}
+
+// MARK: - LiveLogView
+
+/// TranscriptTailer が AppState.activityLog に積んだ最新エントリを mono font で
+/// 流すカード内 mini-console。inProgress / review のカード末尾に配置し、
+/// Claude が今「何をしているか」をボード上から一目で追えるようにする。
+///
+/// 表示件数は 4 件固定。動的に増減するので、末尾 (最新) のエントリが append
+/// されるたび自動的に古いエントリがはみ出してフェードアウトする
+/// (`.transition(.opacity)` + SwiftUI の implicit animation に任せる)。
+struct LiveLogView: View {
+    @Environment(AppState.self) private var appState
+    let taskID: UUID
+
+    /// 表示する最大件数。カードの他情報 (tag / title / meta) を圧迫しない
+    /// 範囲で 4 件に調整。将来 hover で全件展開する UI を足すなら増やす余地あり。
+    private let maxLines = 4
+
+    var body: some View {
+        let entries = Array((appState.activityLog[taskID] ?? []).suffix(maxLines))
+        if !entries.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(entries, id: \.self) { entry in
+                    Text("\(Self.prefix(for: entry.kind)) \(entry.text)")
+                        .font(WFFont.mono(9))
+                        .foregroundStyle(Self.color(for: entry.kind))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(WF.paperAlt, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(WF.ink3.opacity(0.3), lineWidth: 0.8)
+            )
+            .animation(.smooth(duration: 0.2), value: appState.activityLog[taskID]?.count)
+        }
+    }
+
+    private static func prefix(for kind: TranscriptTailer.LogEntry.Kind) -> String {
+        switch kind {
+        case .user:      return "›"
+        case .assistant: return "✦"
+        case .tool:      return "→"
+        case .system:    return "·"
+        }
+    }
+
+    private static func color(for kind: TranscriptTailer.LogEntry.Kind) -> Color {
+        switch kind {
+        case .user:      return WF.ink
+        case .assistant: return WF.accent
+        case .tool:      return WF.warn
+        case .system:    return WF.ink3
         }
     }
 }

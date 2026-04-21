@@ -97,7 +97,7 @@ struct AppStateTests {
     // MARK: - deleteTask
 
     @Test("deleteTask: 指定タスクが消える + selectedTaskID もクリア")
-    func deleteTaskClearsSelection() {
+    func deleteTaskClearsSelection() async {
         let saveURL = Self.tempSaveURL()
         defer { try? FileManager.default.removeItem(at: saveURL) }
 
@@ -106,7 +106,10 @@ struct AppStateTests {
         let id = state.tasks[0].id
         state.selectedTaskID = id
 
-        state.deleteTask(id: id)
+        // planning ステージ = worktree 未作成 + surface 無し。async 化後も
+        // performCleanup は no-op で素通りするため、tasks 除去と
+        // selectedTaskID クリアのみ検証する (wt 非依存)。
+        await state.deleteTask(id: id)
 
         #expect(state.tasks.isEmpty)
         #expect(state.selectedTaskID == nil)

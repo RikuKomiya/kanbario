@@ -166,6 +166,36 @@ enum ClaudeActivity: String {
     case needsInput  // Stop hook = ターン終了、ユーザー入力待ち
 }
 
+// MARK: - TodoItem
+
+/// Claude の TodoWrite tool が登録した 1 項目。Kanbario のカード上に
+/// 「◼ done / ◻ pending / ▸ in progress」形式で並べるのに使う。
+struct TodoItem: Hashable {
+    /// "pending" / "in_progress" / "completed" の 3 値。Codable 化はしない
+    /// (永続化対象外、transcript から毎回再構成する)。
+    let content: String
+    let status: String
+    let activeForm: String?  // "Fetching LiveKit changelogs" みたいな現在進行形
+}
+
+// MARK: - CurrentActivity
+
+/// カード上で「今 Claude が何をしているか」を live 表示するための集約状態。
+/// 各フィールドは transcript JSONL の行を追って随時更新する。
+///
+/// - `todos`: 最新 TodoWrite の todos 配列。空なら TodoWrite 未使用セッション
+/// - `activeToolName` / `activeToolInputSummary` / `activeToolID`:
+///   最新 tool_use で、対応する tool_result がまだ来ていないもの。nil なら
+///   「何も実行中ではない」= ユーザー入力待ちか idle。
+/// - `turnStartedAt`: 直近の user message 到着時刻。経過時間計算に使う。
+struct CurrentActivity: Hashable {
+    var todos: [TodoItem] = []
+    var activeToolName: String? = nil
+    var activeToolInputSummary: String? = nil
+    var activeToolID: String? = nil
+    var turnStartedAt: Date? = nil
+}
+
 // MARK: - Project
 
 struct Project: Identifiable, Codable, Hashable {

@@ -53,6 +53,32 @@ final class AppState {
     /// tasks と違って永続化しない — surface が live な間だけ意味がある。
     var worktreeURLByTaskID: [UUID: URL] = [:]
 
+    /// Claude transcript JSONL から抽出した live log。taskID ごとに最新 50 件まで
+    /// 保持。カード UI は末尾 3-5 件を mono font で表示する。永続化はしない
+    /// (transcript ファイル自体が source of truth、アプリ再起動時は session-start
+    /// hook 再到着を待って再 tail する)。
+    var activityLog: [UUID: [TranscriptTailer.LogEntry]] = [:]
+
+    /// Claude の「今動いている感」をカードに表示するための状態。TodoWrite の
+    /// todos / 最新 tool_use と未解決 tool_use_id / turn 開始時刻を保持する。
+    /// 永続化しない (live data)。
+    var currentActivityByTaskID: [UUID: CurrentActivity] = [:]
+
+    /// Notification hook が「permission 要求中」を示した時にそのメッセージを
+    /// 保持する。UserPromptSubmit / PreToolUse / Stop / SessionEnd 等、
+    /// 「何らかの次アクション」が起きた時点で自動クリアする。カード上に
+    /// 赤バッジ + tooltip で詳細を見せるため、永続化しない。
+    var pendingPermissionByTaskID: [UUID: String] = [:]
+
+    /// NewTaskSheet の表示 state を AppState 側に持つ source of truth。
+    /// App レベルの `.commands` (⌘N) からも ContentView からも一貫して
+    /// 触れるようにするため。
+    var showingNewTaskSheet: Bool = false
+
+    /// taskID → 稼働中の TranscriptTailer。session-start で起動、
+    /// session-end / performCleanup / handleSurfaceClosed で停止する。
+    private var transcriptTailers: [UUID: TranscriptTailer] = [:]
+
     /// terminalArea で「今表示すべき surface」の ID。
     /// - nil: 選択中タスクの claude surface (従来挙動)
     /// - non-nil かつ shellSurfaces にある: その shell タブ
@@ -129,9 +155,20 @@ final class AppState {
 
     /// 新規タスクを planning 列に追加する。LLM メタ (tag / risk / owner / promptV /
     /// needs) はデザイン wireframe の planning ステージカード相当で任意入力。
+    ///
+    /// **Branch 名の決定:**
+    /// - `branch` 引数が与えられたらそれをそのまま使う (フォームでユーザーが
+    ///   入力した値、または ✨ AI ボタンで LLM 生成した値が渡ってくる)。
+    /// - nil / 空の場合は uuid ベースの `kanbario/<uuid6>` を fallback として使う。
+    ///
+    /// 以前は addTask 直後に fire-and-forget で LLM 呼び出しを走らせていたが、
+    /// タスク作成後に branch 名が非同期に書き換わるのが UX 的に予測しにくく、
+    /// 古い name で wt remove に失敗するレース条件もあったため廃止。branch 名
+    /// の選択は NewTaskSheet に移譲し、ユーザーが明示的に決める形にした。
     func addTask(
         title: String,
         body: String,
+        branch: String? = nil,
         tag: LLMTag? = nil,
         risk: RiskLevel? = nil,
         owner: String? = nil,
@@ -140,13 +177,20 @@ final class AppState {
     ) {
         let id = UUID()
         let now = Date()
+        let resolvedBranch: String = {
+            if let b = branch?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !b.isEmpty {
+                return b
+            }
+            return "kanbario/\(id.uuidString.prefix(6).lowercased())"
+        }()
         let task = TaskCard(
             id: id,
             projectID: defaultProject.id,
             title: title,
             body: body,
             status: .planning,
-            branch: "kanbario/\(id.uuidString.prefix(6).lowercased())",
+            branch: resolvedBranch,
             createdAt: now,
             updatedAt: now,
             tag: tag,
@@ -178,12 +222,76 @@ final class AppState {
         save()
     }
 
-    /// タスクを削除する (cleanup 後に呼ばれる想定)。
-    func deleteTask(id: UUID) {
+    /// 削除操作の前に task の worktree に未コミット変更があるか確かめる。
+    /// - 戻り値が URL → dirty (未コミット変更あり)。UI は確認 alert を出す。
+    /// - 戻り値が nil → clean or worktree 不在 (planning ステージ等)。即削除 OK。
+    ///
+    /// worktree URL の解決は ephemeral cache → wt list の 2 段 fallback。
+    /// アプリ再起動後は cache が空なので wt list から引く。
+    func checkWorktreeDirty(task: TaskCard) async -> URL? {
+        guard let wt = worktreeService else { return nil }
+        let worktreeURL: URL
+        if let cached = worktreeURLByTaskID[task.id] {
+            worktreeURL = cached
+        } else if let all = try? await wt.list(),
+                  let found = all.first(where: { $0.branch == task.branch }) {
+            worktreeURL = URL(fileURLWithPath: found.path)
+        } else {
+            // worktree 自体が無い (planning or 既に削除済) → dirty 判定不要。
+            return nil
+        }
+        return await wt.isDirty(worktreePath: worktreeURL) ? worktreeURL : nil
+    }
+
+    /// タスクを削除する。アーカイブ的な操作 (Done 経由ではない廃棄) も同じ経路。
+    /// ステージに関わらず surface teardown + wt remove を試みてから tasks から除く。
+    /// planning は worktree 未作成・surface 無しなので no-op で素通り、
+    /// done は wt remove を既に実行済だが冪等 (branch が無ければ wt が NO-OP 相当)。
+    func deleteTask(id: UUID) async {
+        guard let task = tasks.first(where: { $0.id == id }) else { return }
+        await performCleanup(task: task)
         tasks.removeAll(where: { $0.id == id })
         worktreeURLByTaskID.removeValue(forKey: id)
         if selectedTaskID == id { selectedTaskID = nil }
         save()
+    }
+
+    /// surface teardown + wt remove を 1 まとめにした helper。deleteTask と
+    /// moveToDone の両方から呼ばれる。呼び出し側は tasks 配列の更新や status
+    /// 遷移を別途行うこと (この関数は物理 cleanup だけに責務を絞る)。
+    ///
+    /// wt remove 失敗は lastError に積むが throw しない — 上位が「タスクを
+    /// 消す」操作自体を完遂できるように。worktree が手動削除済・未作成等の
+    /// 場合でも先に進めるべきなので force を立てる。
+    private func performCleanup(task: TaskCard) async {
+        // transcript tail は surface teardown より先に止める (tail の delete
+        // イベントが teardown と競合しないように)。
+        stopTranscriptTail(taskID: task.id)
+
+        if let surface = activeSurfaces[task.id] {
+            await MainActor.run { surface.teardown() }
+            activeSurfaces.removeValue(forKey: task.id)
+            activitiesByTaskID.removeValue(forKey: task.id)
+            collapseTerminalIfEmpty()
+        }
+        // activityLog は残さない (タスクが消える / done になるなら履歴も不要)。
+        activityLog.removeValue(forKey: task.id)
+        currentActivityByTaskID.removeValue(forKey: task.id)
+        pendingPermissionByTaskID.removeValue(forKey: task.id)
+
+        if let wt = worktreeService {
+            do {
+                try await wt.remove(branch: task.branch, force: true)
+            } catch {
+                // 既に worktree が無い / branch が merged 済等で失敗しても、
+                // タスク削除自体は進めたい。user に見える形で残しておくだけ。
+                lastError = "wt remove failed: \(error) (worktree を手動削除してください)"
+            }
+        }
+
+        // worktree path cache は成否に関わらず除去 — 存在しない dir で shell を
+        // 開く事故を防ぐ。
+        worktreeURLByTaskID.removeValue(forKey: task.id)
     }
 
     // MARK: - Repo selection
@@ -221,7 +329,18 @@ final class AppState {
         guard activeSurfaces[task.id] == nil else { return }
 
         do {
-            let worktreeURL = try await wt.create(branch: task.branch)
+            // createOrAttach は「既存 worktree なら attach、未作成なら新規」を
+            // 自動判別する。ユーザーが NewTaskSheet の branch picker で既存
+            // branch を選んだケース / 既に途中まで作業していた branch を指定
+            // したケースが両方シームレスに扱える。
+            let (worktreeURL, wasCreated) = try await wt.createOrAttach(branch: task.branch)
+            _ = wasCreated  // hook 実行は WorktreeService 内部で行う
+            // post-create hook が失敗していれば warning を露出する
+            // (worktree 自体は作成済なので起動は続行する。ユーザーが hook を
+            //  設定していないケースでは nil のまま何も通知しない)。
+            if let hookErr = await wt.lastHookError {
+                lastError = hookErr
+            }
             let surface = try ClaudeSessionFactory.makeSurface(
                 task: task, worktreeURL: worktreeURL
             )
@@ -379,6 +498,10 @@ final class AppState {
         guard activeSurfaces[taskID] != nil else { return }
         activeSurfaces.removeValue(forKey: taskID)
         activitiesByTaskID.removeValue(forKey: taskID)
+        pendingPermissionByTaskID.removeValue(forKey: taskID)
+        // transcript tail も止める。session-end hook と冗長だが、hook が飛ばない
+        // 異常終了経路 (SIGKILL 等) での fd leak を防ぐ安全弁。
+        stopTranscriptTail(taskID: taskID)
         applyStatus(id: taskID, to: .review)
         collapseTerminalIfEmpty()
     }
@@ -419,6 +542,17 @@ final class AppState {
                 applyStatusFromHook(idx: idx, to: .inProgress)
             }
             activitiesByTaskID[id] = .running
+            // transcript JSONL の tail を開始して live log を流し込む。
+            // Claude Code は SessionStart の stdin JSON に
+            // `transcript_path` を含めるのでこれを最優先 (encode 規則に
+            // 依存せず済む)。それが無い旧版互換のため、session_id +
+            // worktreeURL からパスを自力構築する fallback も持つ。
+            if let transcriptURL = Self.resolveTranscriptURL(
+                payload: message.payload,
+                worktreeURL: worktreeURLByTaskID[id]
+            ) {
+                startTranscriptTail(taskID: id, transcriptURL: transcriptURL)
+            }
 
         case "prompt-submit", "pre-tool-use":
             // ユーザー入力 or tool 実行 = claude が能動的に動いている。
@@ -427,6 +561,9 @@ final class AppState {
                 applyStatusFromHook(idx: idx, to: .inProgress)
             }
             activitiesByTaskID[id] = .running
+            // 前ターンで来ていた permission 要求は「次のアクションが
+            // 起きた時点」で解消したとみなしてクリア。
+            pendingPermissionByTaskID.removeValue(forKey: id)
 
         case "stop":
             // ターン終了 = claude が「次のユーザー入力を待っています」状態。
@@ -445,15 +582,21 @@ final class AppState {
                 applyStatusFromHook(idx: idx, to: .review)
             }
             activitiesByTaskID.removeValue(forKey: id)
+            pendingPermissionByTaskID.removeValue(forKey: id)
+            // transcript tail を停止 (fd leak 防止)。
+            stopTranscriptTail(taskID: id)
 
         case "notification":
             // claude の Notification hook は tool 承認待ち / idle タイムアウト等で
             // 発火する。ユーザーが kanbario を裏に回していると気付けないので、
-            // macOS Notification Center に昇格する。タスクタイトルを title に、
-            // payload.message を body に。message が取れなければ generic 文言。
+            // macOS Notification Center に昇格する + permission 系メッセージは
+            // カード UI に専用バッジでも出す (気付きやすさ優先)。
             let body = Self.extractNotificationMessage(from: message.payload)
                 ?? "Claude から通知があります"
             NotificationService.shared.post(title: tasks[idx].title, body: body)
+            if Self.isPermissionMessage(body) {
+                pendingPermissionByTaskID[id] = body
+            }
 
         default:
             break
@@ -491,33 +634,12 @@ final class AppState {
             .path
     }
 
-    /// review → done drag で呼ばれる。surface teardown → wt remove → done へ遷移。
-    /// wt remove が失敗しても done 状態までは進める (worktree は手動削除できる)。
+    /// review → done drag で呼ばれる。物理 cleanup (surface teardown + wt remove)
+    /// → done 状態に遷移。cleanup が失敗しても done 状態までは進める
+    /// (worktree は手動削除できる前提)。
     func moveToDone(task: TaskCard) async {
         guard task.status == .review else { return }
-
-        if let surface = activeSurfaces[task.id] {
-            await MainActor.run {
-                surface.teardown()
-            }
-            activeSurfaces.removeValue(forKey: task.id)
-            activitiesByTaskID.removeValue(forKey: task.id)
-            collapseTerminalIfEmpty()
-        }
-
-        if let wt = worktreeService {
-            do {
-                try await wt.remove(branch: task.branch, force: true)
-            } catch {
-                lastError = "wt remove failed: \(error) (worktree を手動削除してください)"
-            }
-        }
-
-        // worktree は消えた or 消そうとした → そのパスで shell タブを開いて
-        // 欲しくない。entry を掃除する。失敗時に残しておくと存在しない dir で
-        // shell 起動を試みる事故になるので、成否に関わらず削除。
-        worktreeURLByTaskID.removeValue(forKey: task.id)
-
+        await performCleanup(task: task)
         applyStatus(id: task.id, to: .done)
     }
 
@@ -586,6 +708,190 @@ final class AppState {
         struct NotificationPayload: Decodable { let message: String? }
         let decoded = try? JSONDecoder().decode(NotificationPayload.self, from: data)
         return decoded?.message?.isEmpty == false ? decoded?.message : nil
+    }
+
+    /// Notification message が tool permission / approval 要求系かを粗く判定。
+    /// Claude Code の実際の message 例:
+    ///   - "Claude needs your permission to use Bash"
+    ///   - "Claude needs your permission to use Edit"
+    ///   - "Approval required for ..."
+    /// 単純なキーワード match で十分 (他の notification 種別、例えば idle
+    /// タイムアウト通知は弾かれて通常の OS 通知だけになる)。
+    fileprivate static func isPermissionMessage(_ body: String) -> Bool {
+        let lowered = body.lowercased()
+        return lowered.contains("permission")
+            || lowered.contains("approval")
+            || lowered.contains("needs your")
+    }
+
+    /// SessionStart hook の stdin JSON から transcript ファイル URL を解決する。
+    ///
+    /// 優先順:
+    /// 1. payload の `transcript_path` (Claude Code が絶対パスで渡す)
+    /// 2. payload の `session_id` + worktreeURL から自力構築
+    ///    (古い Claude Code 版や encode 規則差異への fallback)
+    ///
+    /// どちらの情報も得られなければ nil → tail しない。
+    fileprivate static func resolveTranscriptURL(
+        payload: String,
+        worktreeURL: URL?
+    ) -> URL? {
+        guard let data = payload.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        if let path = json["transcript_path"] as? String, !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        let sessionID = (json["session_id"] as? String)
+            ?? (json["sessionId"] as? String)
+            ?? ""
+        guard !sessionID.isEmpty, let worktreeURL else { return nil }
+        return TranscriptTailer.transcriptURL(
+            for: worktreeURL, sessionID: sessionID
+        )
+    }
+
+    // MARK: - Transcript tail
+
+    /// 新しい TranscriptTailer を起動し、activityLog と currentActivityByTaskID
+    /// を更新する buffer として受ける。既に tailer が動いているタスクでは
+    /// no-op (重複起動で log が二重化するのを防ぐ)。
+    fileprivate func startTranscriptTail(
+        taskID: UUID,
+        transcriptURL: URL
+    ) {
+        guard transcriptTailers[taskID] == nil else { return }
+        let tailer = TranscriptTailer(transcriptURL: transcriptURL) { [weak self] entry, rawLine in
+            // closure boundary を越えるのは Sendable な Data まで。
+            // dict 化は MainActor 内で行う (Any の Sendable 違反を回避)。
+            Task { @MainActor in
+                guard let self else { return }
+                if let entry {
+                    var log = self.activityLog[taskID] ?? []
+                    log.append(entry)
+                    // 保持件数上限 50 (UI 表示は末尾 3-5 件のみ、残りは将来
+                    // スクロール展開できるよう残す。メモリ肥大の抑制)。
+                    if log.count > 50 { log.removeFirst(log.count - 50) }
+                    self.activityLog[taskID] = log
+                }
+                if let raw = (try? JSONSerialization.jsonObject(with: rawLine))
+                    as? [String: Any] {
+                    self.updateCurrentActivity(taskID: taskID, raw: raw)
+                }
+            }
+        }
+        transcriptTailers[taskID] = tailer
+        tailer.start()
+    }
+
+    fileprivate func stopTranscriptTail(taskID: UUID) {
+        transcriptTailers[taskID]?.stop()
+        transcriptTailers.removeValue(forKey: taskID)
+        currentActivityByTaskID.removeValue(forKey: taskID)
+    }
+
+    /// transcript 行 1 つから CurrentActivity を更新する。
+    ///
+    /// ルール:
+    /// - `type == "user"` with plain text → turnStartedAt = 時刻、activeTool クリア
+    /// - `type == "user"` with tool_result → 対応 activeToolID を解消 (クリア)
+    /// - `type == "assistant"` with TodoWrite tool_use → todos 更新
+    /// - `type == "assistant"` with 他 tool_use → activeTool を設定
+    ///
+    /// tool_result は Claude の transcript では user message として記録される
+    /// (Claude SDK の慣例)。この点を踏まえて分岐する。
+    private func updateCurrentActivity(taskID: UUID, raw: [String: Any]) {
+        var activity = currentActivityByTaskID[taskID] ?? CurrentActivity()
+        let type = (raw["type"] as? String) ?? ""
+        let timestamp = (raw["timestamp"] as? String)
+            .flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date()
+
+        switch type {
+        case "user":
+            if let message = raw["message"] as? [String: Any],
+               let blocks = message["content"] as? [[String: Any]] {
+                // tool_result を含む user message は「tool の完了通知」で
+                // ある。該当 id がクリアされて「実行中」状態が終わる。
+                for b in blocks {
+                    if (b["type"] as? String) == "tool_result",
+                       let toolUseID = b["tool_use_id"] as? String,
+                       toolUseID == activity.activeToolID {
+                        activity.activeToolName = nil
+                        activity.activeToolID = nil
+                        activity.activeToolInputSummary = nil
+                        break
+                    }
+                }
+                // プレーンテキストを含む user message は新しいターンの開始。
+                let hasText = blocks.contains { ($0["type"] as? String) == "text" }
+                if hasText || message["content"] is String {
+                    activity.turnStartedAt = timestamp
+                    activity.activeToolName = nil
+                    activity.activeToolID = nil
+                    activity.activeToolInputSummary = nil
+                }
+            } else if let s = (raw["message"] as? [String: Any])?["content"] as? String,
+                      !s.isEmpty {
+                activity.turnStartedAt = timestamp
+            }
+        case "assistant":
+            if let message = raw["message"] as? [String: Any],
+               let blocks = message["content"] as? [[String: Any]] {
+                for b in blocks {
+                    guard (b["type"] as? String) == "tool_use",
+                          let name = b["name"] as? String,
+                          let id = b["id"] as? String else { continue }
+                    let input = b["input"] as? [String: Any] ?? [:]
+                    if name == "TodoWrite",
+                       let todos = input["todos"] as? [[String: Any]] {
+                        activity.todos = todos.compactMap { dict in
+                            guard let content = dict["content"] as? String,
+                                  let status = dict["status"] as? String
+                            else { return nil }
+                            return TodoItem(
+                                content: content,
+                                status: status,
+                                activeForm: dict["activeForm"] as? String
+                            )
+                        }
+                    } else {
+                        activity.activeToolName = name
+                        activity.activeToolID = id
+                        activity.activeToolInputSummary = Self.summarizeToolInput(input)
+                    }
+                }
+            }
+        default:
+            break
+        }
+
+        currentActivityByTaskID[taskID] = activity
+    }
+
+    /// tool_use の input から 1 行サマリを作る (UI 表示用、40 文字くらい)。
+    /// 代表的な key (file_path / url / command / pattern) を優先、無ければ
+    /// 先頭 key を使う。
+    private static func summarizeToolInput(_ input: [String: Any]) -> String? {
+        if input.isEmpty { return nil }
+        let preferredKeys = ["file_path", "path", "url", "command", "pattern",
+                             "prompt", "description"]
+        let key = preferredKeys.first(where: { input[$0] != nil })
+            ?? input.keys.sorted().first
+        guard let key else { return nil }
+        let value = input[key]
+        let stringValue: String
+        if let s = value as? String {
+            stringValue = s
+        } else if let v = value {
+            stringValue = "\(v)"
+        } else {
+            return nil
+        }
+        let single = stringValue.replacingOccurrences(of: "\n", with: " ")
+        let truncated = single.count > 50
+            ? String(single.prefix(50)) + "…"
+            : single
+        return "(\(truncated))"
     }
 }
 

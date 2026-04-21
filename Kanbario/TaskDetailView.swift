@@ -25,6 +25,11 @@ struct TaskDetailView: View {
     /// split モーダル内の右ペインに出すタブ ID。左は activeTerminalID。
     @State private var rightTerminalID: UUID? = nil
 
+    /// Delete 確認 alert の state。dirty な worktree を持つタスクの削除要求
+    /// を一時保留して、ユーザー承認を待つための 2 段階フロー。
+    @State private var pendingDeleteTaskID: UUID? = nil
+    @State private var pendingDeleteDirPath: String = ""
+
     /// **重要:** body は task 選択状態に関わらず常に `panesArea` を含む構造を
     /// 返す。`if let task = selectedTask` で subtree を差し替えると ZStack 内の
     /// libghostty NSView が unmount され、claude が SIGHUP で殺される
@@ -469,20 +474,60 @@ struct TaskDetailView: View {
             .disabled(!canStart(task))
             .help(startHelpText(task))
 
-            Button(role: .destructive) {
-                appState.deleteTask(id: task.id)
-                onClose()
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "trash")
-                    Hand("Delete", size: 12, color: WF.pink)
-                }
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(WF.pink.opacity(0.5), lineWidth: 1.2))
-            }
-            .buttonStyle(.plain)
+            deleteButton(for: task)
         }
         .padding(.top, 6)
+    }
+
+    /// 全 stage で使い回す削除ボタン。Delete は worktree remove と surface
+    /// teardown を伴うため async。dirty worktree の場合は確認 alert を
+    /// 挟んでから実行する (誤削除で uncommitted change を失う事故を防ぐ)。
+    @ViewBuilder
+    private func deleteButton(for task: TaskCard) -> some View {
+        Button(role: .destructive) {
+            Task { await requestDelete(task: task) }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "trash")
+                Hand("Delete", size: 12, color: WF.pink)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(WF.pink.opacity(0.5), lineWidth: 1.2))
+        }
+        .buttonStyle(.plain)
+        .alert(
+            "未コミットの変更があります",
+            isPresented: Binding(
+                get: { pendingDeleteTaskID != nil },
+                set: { if !$0 { pendingDeleteTaskID = nil } }
+            ),
+            presenting: pendingDeleteTaskID
+        ) { id in
+            Button("削除する", role: .destructive) {
+                onClose()
+                Task { await appState.deleteTask(id: id) }
+                pendingDeleteTaskID = nil
+            }
+            Button("キャンセル", role: .cancel) {
+                pendingDeleteTaskID = nil
+            }
+        } message: { _ in
+            Text("\(pendingDeleteDirPath) に未コミットの変更があります。削除するとこの変更は失われます。")
+        }
+    }
+
+    /// Delete ボタン押下時のエントリ。dirty なら confirm alert、clean なら即削除。
+    /// dirty 判定は git status --porcelain で、worktree 無し / planning などは
+    /// 全て clean 扱い (即削除)。
+    @MainActor
+    private func requestDelete(task: TaskCard) async {
+        if let dirtyURL = await appState.checkWorktreeDirty(task: task) {
+            pendingDeleteDirPath = dirtyURL.lastPathComponent
+            pendingDeleteTaskID = task.id
+        } else {
+            onClose()
+            await appState.deleteTask(id: task.id)
+        }
     }
 
     @ViewBuilder
@@ -512,6 +557,9 @@ struct TaskDetailView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .sketchBox(fill: WF.paperAlt, radius: 8, shadow: false)
         }
+
+        deleteButton(for: task)
+            .padding(.top, 8)
     }
 
     @ViewBuilder

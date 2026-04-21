@@ -12,12 +12,16 @@ import AppKit
 /// SIGHUP で殺される (PR #4 の根本原因と同じ罠)。
 struct ContentView: View {
     @Environment(AppState.self) private var appState
-    @State private var isShowingNewTask = false
 
     var body: some View {
+        // NewTaskSheet 表示 state を AppState 側で管理 (App 全体の Commands
+        // menu ⌘N からも切り替えられるようにするため)。@Bindable で
+        // `$appState.showingNewTaskSheet` として .sheet に渡す。
+        @Bindable var state = appState
+
         ZStack {
             // ── 下層: ボード
-            KanbanBoardView(onNewTask: { isShowingNewTask = true })
+            KanbanBoardView(onNewTask: { appState.showingNewTaskSheet = true })
                 .opacity(isModalOpen ? 0.45 : 1)
                 .allowsHitTesting(!isModalOpen)
                 .animation(.smooth(duration: 0.22), value: isModalOpen)
@@ -38,7 +42,7 @@ struct ContentView: View {
                 repoChip
             }
         }
-        .sheet(isPresented: $isShowingNewTask) {
+        .sheet(isPresented: $state.showingNewTaskSheet) {
             NewTaskSheet()
         }
         .alert(
