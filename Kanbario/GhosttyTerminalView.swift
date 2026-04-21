@@ -380,6 +380,24 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
             }
         }
 
+        // ESC key bypass: interpretKeyEvents は ESC を doCommandBySelector
+        // (cancelOperation:) にマップするが、これは未実装 → responder chain を
+        // 上って最終的に NSApp に届き、macOS のフルスクリーン gesture が
+        // 「ESC → フルスクリーン解除」を発火する。ターミナル内で ESC が使えない
+        // ような UX は致命的なので、この IME 経路に渡さず libghostty に直送 +
+        // 即 return で event を consume する。
+        //   - keyCode 53 = kVK_Escape
+        //   - modifier 無しの pure ESC のみ対象 (⌘ESC 等は通常経路に任せる)
+        //   - IME composition 中は escape でキャンセル動作が必要なので除外
+        if event.keyCode == 53,
+           flags.isEmpty,
+           !hasMarkedText() {
+            ghostty_surface_set_focus(surface, true)
+            if sendBasicKey(surface: surface, event: event, useIgnoringModifiers: false) {
+                return
+            }
+        }
+
         // IME / text-composition path (cmux §6764-7100 condensed). The trick is:
         //   1. Set keyTextAccumulator so insertText can append into it.
         //   2. Let AppKit's interpretKeyEvents deliver the key to the active

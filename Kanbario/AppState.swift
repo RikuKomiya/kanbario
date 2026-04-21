@@ -46,6 +46,13 @@ final class AppState {
     var shellSurfaces: [UUID: TerminalSurface] = [:]
     var shellTabOrder: [UUID] = []
 
+    /// Start 時に wt が作成した worktree の絶対パスを taskID ごとに保持する。
+    /// 新規 shell タブの cwd をそのタスクの worktree に合わせるために使う
+    /// (main repo root ではなく、その claude が作業している worktree で shell を
+    /// 開く方が「tab を増やして脇で git log や rg したい」という実利用に合う)。
+    /// tasks と違って永続化しない — surface が live な間だけ意味がある。
+    var worktreeURLByTaskID: [UUID: URL] = [:]
+
     /// terminalArea で「今表示すべき surface」の ID。
     /// - nil: 選択中タスクの claude surface (従来挙動)
     /// - non-nil かつ shellSurfaces にある: その shell タブ
@@ -120,8 +127,17 @@ final class AppState {
 
     // MARK: - Mutations
 
-    /// 新規タスクを planning 列に追加する。
-    func addTask(title: String, body: String) {
+    /// 新規タスクを planning 列に追加する。LLM メタ (tag / risk / owner / promptV /
+    /// needs) はデザイン wireframe の planning ステージカード相当で任意入力。
+    func addTask(
+        title: String,
+        body: String,
+        tag: LLMTag? = nil,
+        risk: RiskLevel? = nil,
+        owner: String? = nil,
+        promptV: String? = nil,
+        needs: [String]? = nil
+    ) {
         let id = UUID()
         let now = Date()
         let task = TaskCard(
@@ -132,7 +148,12 @@ final class AppState {
             status: .planning,
             branch: "kanbario/\(id.uuidString.prefix(6).lowercased())",
             createdAt: now,
-            updatedAt: now
+            updatedAt: now,
+            tag: tag,
+            risk: risk,
+            promptV: promptV,
+            owner: owner,
+            needs: (needs?.isEmpty ?? true) ? nil : needs
         )
         tasks.append(task)
         save()
@@ -160,6 +181,7 @@ final class AppState {
     /// タスクを削除する (cleanup 後に呼ばれる想定)。
     func deleteTask(id: UUID) {
         tasks.removeAll(where: { $0.id == id })
+        worktreeURLByTaskID.removeValue(forKey: id)
         if selectedTaskID == id { selectedTaskID = nil }
         save()
     }
@@ -204,6 +226,7 @@ final class AppState {
                 task: task, worktreeURL: worktreeURL
             )
             activeSurfaces[task.id] = surface
+            worktreeURLByTaskID[task.id] = worktreeURL
             applyStatus(id: task.id, to: .inProgress)
         } catch {
             lastError = "Start failed: \(error)"
@@ -217,22 +240,112 @@ final class AppState {
         activeSurfaces[id]?.requestClose()
     }
 
+    /// surface が不在なタスクの詳細を開いた時、`claude --continue` で会話を
+    /// 自動復帰させる。
+    ///
+    /// 対象ステージ:
+    ///   - `review`: hook 経由でターン終了が通知された正常な終了
+    ///   - `inProgress`: hook が飛ばずに surface だけ消えた状態 (app 強制終了、
+    ///     claude プロセスクラッシュ、ssh 切断等)。ここを resume しないと
+    ///     ユーザーは placeholder を見続けることになる
+    ///
+    /// planning / done は対象外 (planning は Start 前、done は worktree 削除済)。
+    ///
+    /// 呼び出し側: TaskDetailView が selectedTaskID 変化を検知して発火。
+    /// 競合防止のため、activeSurfaces に既に entry があれば何もしない。
+    /// worktree URL が手元に無い場合は `wt list` で引き直す
+    /// (worktreeURLByTaskID は ephemeral なのでアプリ再起動後は空)。
+    func resumeTask(_ task: TaskCard) async {
+        guard task.status == .review || task.status == .inProgress else { return }
+        guard activeSurfaces[task.id] == nil else { return }
+        guard let wt = worktreeService else {
+            // repo 未設定ならそもそも resume できない。無音で抜ける
+            // (ボード表示は placeholder のままになる)。
+            return
+        }
+
+        // worktree URL を解決: ephemeral dict にあればそれ、
+        // 無ければ wt.list() で branch から逆引き。
+        let worktreeURL: URL
+        if let cached = worktreeURLByTaskID[task.id] {
+            worktreeURL = cached
+        } else {
+            do {
+                let all = try await wt.list()
+                guard let found = all.first(where: { $0.branch == task.branch }) else {
+                    // worktree が無い = 前回手動削除されたか wt が壊れた可能性。
+                    // エラーにせず placeholder を残す (ユーザーが気付けるよう
+                    // lastError に残してもいいが、毎回 modal 開くたびに alert
+                    // が出ると煩いので silent に)。
+                    return
+                }
+                worktreeURL = URL(fileURLWithPath: found.path)
+                worktreeURLByTaskID[task.id] = worktreeURL
+            } catch {
+                lastError = "wt list failed while resuming: \(error)"
+                return
+            }
+        }
+
+        do {
+            let surface = try ClaudeSessionFactory.makeSurface(
+                task: task, worktreeURL: worktreeURL, resume: true
+            )
+            activeSurfaces[task.id] = surface
+
+            // 復帰直後の claude は「前回のやり取りを表示して入力待ち」=
+            // 意味論的に review (needsInput)。異常終了で inProgress に
+            // 固まっていたタスクをここで正規化することで、次に prompt を
+            // 打った瞬間に review → inProgress → stop → review の通常
+            // サイクルに戻れる。
+            if task.status == .inProgress {
+                applyStatus(id: task.id, to: .review)
+            }
+            activitiesByTaskID[task.id] = .needsInput
+        } catch {
+            lastError = "Resume failed: \(error)"
+        }
+    }
+
     // MARK: - Shell tabs (expanded 中 ⌘T で開く普通のターミナル)
 
-    /// 新しい shell タブを開き、activeSurfaces に追加して選択中にする。
-    /// 起動 shell はユーザーの `$SHELL` (fallback `/bin/zsh`)、worktree ではなく
-    /// repo root を cwd にする (タスクと独立した作業領域として扱う)。
+    /// 新しい shell タブを開き、activeSurfaces に追加する。
+    /// 起動 shell はユーザーの `$SHELL` (fallback `/bin/zsh`)。
+    ///
+    /// cwd の決定順:
+    ///   1. 選択中タスクの worktree (Start 済で `worktreeURLByTaskID` にある)
+    ///      — その claude と同じ workspace で脇作業 (`git log`, `rg` 等) が
+    ///      できる方が実利用に合う。
+    ///   2. main repo root — 選択中タスク無し or worktree 未作成時
+    ///   3. nil — repoPath 未設定時 (shell は HOME で起動)
+    ///
+    /// `selectAsLeftPane`: true なら作成直後に `selectedTerminalID` を更新して
+    /// 左ペインの active にする (⌘T の通常挙動)。split モードで右ペイン専用に
+    /// 作る場合は false を渡す — 左ペインと同じ surface を指すと libghostty の
+    /// attach が競合して右が空になる。
     @discardableResult
-    func openShellTab() -> UUID? {
+    func openShellTab(selectAsLeftPane: Bool = true) -> UUID? {
         let id = UUID()
+        let cwd: String? = preferredShellCwd()
         let surface = ShellTabFactory.makeSurface(
             id: id,
-            workingDirectory: repoPath.isEmpty ? nil : repoPath
+            workingDirectory: cwd
         )
         shellSurfaces[id] = surface
         shellTabOrder.append(id)
-        selectedTerminalID = id
+        if selectAsLeftPane {
+            selectedTerminalID = id
+        }
         return id
+    }
+
+    /// openShellTab の cwd を解決する。選択中タスクの worktree を優先。
+    private func preferredShellCwd() -> String? {
+        if let taskID = selectedTaskID,
+           let url = worktreeURLByTaskID[taskID] {
+            return url.path
+        }
+        return repoPath.isEmpty ? nil : repoPath
     }
 
     /// ユーザーが shell タブを閉じた時。libghostty に SIGHUP を送ってもらい、
@@ -399,6 +512,11 @@ final class AppState {
                 lastError = "wt remove failed: \(error) (worktree を手動削除してください)"
             }
         }
+
+        // worktree は消えた or 消そうとした → そのパスで shell タブを開いて
+        // 欲しくない。entry を掃除する。失敗時に残しておくと存在しない dir で
+        // shell 起動を試みる事故になるので、成否に関わらず削除。
+        worktreeURLByTaskID.removeValue(forKey: task.id)
 
         applyStatus(id: task.id, to: .done)
     }
