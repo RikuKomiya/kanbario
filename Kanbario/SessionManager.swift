@@ -24,10 +24,16 @@ enum ClaudeSessionFactory {
     /// Build a `TerminalSurface` for the given task inside `worktreeURL`.
     /// The surface is not yet attached to a view — the SwiftUI wrapper will
     /// `attachToView` when the NSView materializes.
+    ///
+    /// `resume: true` で起動すると `claude --continue` を実行し、この worktree
+    /// 内の最新会話を読み直す (task.body は使われない、既に会話履歴に入っている)。
+    /// review ステージで「セッションが切れたタスクを開いた瞬間に会話を復帰」
+    /// する用途。
     static func makeSurface(
         task: TaskCard,
         worktreeURL: URL,
-        claudeExecutable: URL? = nil
+        claudeExecutable: URL? = nil,
+        resume: Bool = false
     ) throws -> TerminalSurface {
         // Bundle 同梱の shim (Resources/bin/claude) を最優先で起動する。
         // shim が --settings で hook を注入し、内部で real claude を exec
@@ -108,7 +114,12 @@ enum ClaudeSessionFactory {
         // - exec: claude で shell を置換して PID を 1 段減らし、Stop ボタンの
         //   SIGHUP 伝播経路を変えない
         let claudeInvocation: String
-        if task.body.isEmpty {
+        if resume {
+            // --continue はこの cwd (= worktree) の最新会話を読み直す。
+            // kanbario は task 1 つに worktree 1 つなので session-id を
+            // 引数で指定する必要はない (--resume <id> ではなく --continue)。
+            claudeInvocation = "\(shellQuote(executable.path)) --continue"
+        } else if task.body.isEmpty {
             claudeInvocation = shellQuote(executable.path)
         } else {
             claudeInvocation = "\(shellQuote(executable.path)) \(shellQuote(task.body))"
