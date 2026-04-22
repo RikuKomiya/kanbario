@@ -35,5 +35,14 @@ struct KanbarioApp: App {
                 .disabled(appState.showingNewTaskSheet)
             }
         }
+
+        // Project Shell Window。task に紐付かない、リポジトリ大元で開く
+        // 汎用ターミナル。`@Environment(\.openWindow)` から id 指定で開く。
+        // singleton scene なので、何度開こうとしても同じウィンドウが前面化
+        // される (macOS の Window 標準挙動)。
+        Window("Project Shell", id: "project-shell") {
+            ProjectShellView()
+                .environment(appState)
+        }
     }
 }

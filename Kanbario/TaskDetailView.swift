@@ -25,10 +25,10 @@ struct TaskDetailView: View {
     /// split モーダル内の右ペインに出すタブ ID。左は activeTerminalID。
     @State private var rightTerminalID: UUID? = nil
 
-    /// Delete 確認 alert の state。dirty な worktree を持つタスクの削除要求
-    /// を一時保留して、ユーザー承認を待つための 2 段階フロー。
-    @State private var pendingDeleteTaskID: UUID? = nil
-    @State private var pendingDeleteDirPath: String = ""
+    // Delete 確認 alert の state は AppState.pendingDeleteConfirmation に
+    // 統一 (ContentView 側で alert を 1 箇所にまとめて表示)。この View では
+    // ローカルに保持しない — カード context menu 経由の削除フローと共通化
+    // したいので app-level に置いた方が素直。
 
     /// **重要:** body は task 選択状態に関わらず常に `panesArea` を含む構造を
     /// 返す。`if let task = selectedTask` で subtree を差し替えると ZStack 内の
@@ -45,21 +45,24 @@ struct TaskDetailView: View {
             metaSection
             Divider().overlay(WF.line).opacity(0.6)
 
-            // tab bar は常時表示 (中身は surface の有無で変わる)
-            tabBar
-                .background(WF.paperAlt)
-            Divider().overlay(WF.line).opacity(0.6)
+            // tab bar は planning / done では不要 (terminal を出さないので
+            // 新規 shell タブを開いても意味がない)。inProgress / review
+            // かつ terminal 実体がある時だけ表示する。
+            if shouldShowTerminalArea {
+                tabBar.background(WF.paperAlt)
+                Divider().overlay(WF.line).opacity(0.6)
+            }
 
             // ★ identity 維持の要: task 未選択でも panesArea は必ずマウントする。
             //   中身が空 (activeSurfaces / shellSurfaces がゼロ) でも ZStack は
             //   render コストほぼゼロ。逆に subtree を消すと PR #4 の罠を再現する。
             ZStack {
                 panesArea
-                    .opacity(hasAnyTerminal ? 1 : 0)
-                    .allowsHitTesting(hasAnyTerminal)
+                    .opacity(shouldShowTerminalArea ? 1 : 0)
+                    .allowsHitTesting(shouldShowTerminalArea)
 
-                // terminal が無い時に上に重ねる stage placeholder (Planning / Done)
-                if let task = appState.selectedTask, !hasAnyTerminal {
+                // planning / done or terminal 無しでは stage placeholder を表示。
+                if let task = appState.selectedTask, !shouldShowTerminalArea {
                     stagePlaceholder(for: task)
                         .background(WF.paper)
                 }
@@ -78,7 +81,13 @@ struct TaskDetailView: View {
         .shadow(color: Color.black.opacity(0.3), radius: 30, x: 0, y: 20)
         // review ステージのタスクが選ばれ、まだ surface が無い時は
         // `claude --continue` で自動復帰する。nil → id の遷移で発火。
+        //
+        // 併せて split 右ペインの選択 (`rightTerminalID`) も nil にリセット
+        // する。shellTabOrderByTaskID はタスク単位になったので、前タスクの
+        // shell ID を指したまま残すと「切替先タスクでは存在しない shell」
+        // を右ペインにマウントしようとして panesArea が空になる。
         .onChange(of: appState.selectedTaskID) { _, newID in
+            rightTerminalID = nil
             guard let id = newID,
                   let task = appState.tasks.first(where: { $0.id == id })
             else { return }
@@ -129,7 +138,9 @@ struct TaskDetailView: View {
                 if let tag = task.tag {
                     LLMTagPill(tag: tag, size: 11)
                 }
-                Hand(task.title, size: 15, weight: .bold)
+                // task.id で識別して、選択中タスクが切り替わったら
+                // InlineTitleField の @State draft がリセットされるようにする。
+                InlineTitleField(task: task).id(task.id)
             }
             .padding(.leading, 10)
 
@@ -187,10 +198,10 @@ struct TaskDetailView: View {
     ///   1. 既存の shell タブのうち、activeLeftID と **異なる** もの
     ///      (同じ surface を左右で mount すると libghostty が attach 競合する)
     ///   2. 見つからなければ新規 shell を作成 — `selectAsLeftPane: false` で
-    ///      selectedTerminalID を奪わないようにする
+    ///      selectedTerminalIDByTaskID の entry を奪わないようにする
     private func primeRightTabIfNeeded() {
         guard rightTerminalID == nil else { return }
-        if let firstDifferent = appState.shellTabOrder.first(where: { $0 != activeLeftID }) {
+        if let firstDifferent = currentTaskShellIDs.first(where: { $0 != activeLeftID }) {
             rightTerminalID = firstDifferent
         } else {
             rightTerminalID = appState.openShellTab(selectAsLeftPane: false)
@@ -207,7 +218,7 @@ struct TaskDetailView: View {
             Metric(label: "owner", value: task.owner ?? "—")
             Metric(label: "prompt", value: task.promptV ?? "—")
             Metric(label: "branch",
-                   value: task.branch.replacingOccurrences(of: "kanbario/", with: ""),
+                   value: task.displayBranch,
                    color: WF.accent)
             if let eval = task.evalScore {
                 Metric(label: "eval", value: "\(Int((eval*100).rounded()))",
@@ -222,10 +233,32 @@ struct TaskDetailView: View {
 
     // MARK: - Tab bar
 
+    /// 現在選択中のタスクが所有する shell tab の並び (空なら空配列)。
+    /// tabBar / footer / split toggle など「選択中タスクだけに閉じた UI」の
+    /// 単一 source of truth。
+    private var currentTaskShellIDs: [UUID] {
+        guard let id = appState.selectedTaskID else { return [] }
+        return appState.shellTabOrderByTaskID[id] ?? []
+    }
+
     private var hasAnyTerminal: Bool {
         guard let id = appState.selectedTaskID else { return false }
         if appState.activeSurfaces[id] != nil { return true }
-        return !appState.shellTabOrder.isEmpty
+        return !currentTaskShellIDs.isEmpty
+    }
+
+    /// terminal エリア (tab bar + panes) を可視化するかの判定。
+    ///
+    /// planning / done のタスクでは Claude セッションは存在しない or 既に
+    /// 終了済みなので、shell エリアを出す意味が薄い (shell タブは開けるが
+    /// UI を圧迫するだけ)。これらのステージでは terminal を隠して
+    /// planningBody / doneBody の編集 UI / メタ情報だけを全面表示する。
+    /// QA は review と同じ扱い — claude を resume して動かし直せる状態なので
+    /// terminal を出す。
+    private var shouldShowTerminalArea: Bool {
+        guard let task = appState.selectedTask else { return false }
+        if task.status == .planning || task.status == .done { return false }
+        return hasAnyTerminal
     }
 
     private var tabBar: some View {
@@ -239,17 +272,23 @@ struct TaskDetailView: View {
                     icon: "sparkles",
                     isActive: activeLeftID == id,
                     showClose: false,
-                    onSelect: { appState.selectedTerminalID = nil },
+                    onSelect: {
+                        // entry 削除 = 「選択中 task の claude を見る」既定状態。
+                        appState.selectedTerminalIDByTaskID.removeValue(forKey: id)
+                    },
                     onClose: nil
                 )
             }
-            ForEach(Array(appState.shellTabOrder.enumerated()), id: \.element) { index, shellID in
+            ForEach(Array(currentTaskShellIDs.enumerated()), id: \.element) { index, shellID in
                 TabChip(
                     title: "zsh #\(index + 1)",
                     icon: "chevron.left.forwardslash.chevron.right",
                     isActive: activeLeftID == shellID,
                     showClose: true,
-                    onSelect: { appState.selectedTerminalID = shellID },
+                    onSelect: {
+                        guard let tid = appState.selectedTaskID else { return }
+                        appState.selectedTerminalIDByTaskID[tid] = shellID
+                    },
                     onClose: { appState.requestCloseShellTab(id: shellID) }
                 )
             }
@@ -275,13 +314,15 @@ struct TaskDetailView: View {
     // MARK: - Panes
 
     /// 現在左ペインに表示する surface の ID。
-    /// shell が選ばれていればそれ、そうでなければ選択中 task の claude surface。
+    /// 選択中 task の entry に shell が指定されていればそれ、そうでなければ
+    /// claude surface (= task ID)。
     private var activeLeftID: UUID? {
-        if let shell = appState.selectedTerminalID,
+        guard let tid = appState.selectedTaskID else { return nil }
+        if let shell = appState.selectedTerminalIDByTaskID[tid],
            appState.shellSurfaces[shell] != nil {
             return shell
         }
-        return appState.selectedTaskID
+        return tid
     }
 
     /// 左右ペインに mount する surface ID を排他に配分する。
@@ -312,8 +353,15 @@ struct TaskDetailView: View {
         .frame(minHeight: 320)
     }
 
-    /// 全 surface (task claude + shell) の ID を並び順を保って返す。
-    /// `paneStack` はこのリストから割り当て先を絞り込んで mount する。
+    /// 全 surface (全タスクの claude + 全タスクの shell) の ID を並び順を
+    /// 保って返す。`paneStack` はこのリストから割り当て先を絞り込んで mount
+    /// する。
+    ///
+    /// **重要:** tabBar は現在 task の shell だけに絞るが、ZStack に mount
+    /// する surface は**全タスクの shell**を含める。これは libghostty の
+    /// NSView が ZStack から一旦外れると SIGHUP で子プロセスが殺される
+    /// ため (cmux の罠と同じ)。他タスクに切り替えている間も shell を殺さず
+    /// に温存しておくことで、戻ってきた時にそのまま作業を続けられる。
     private var allSurfaceIDs: [UUID] {
         var ids: [UUID] = []
         // task 側は tasks 配列の順で (Dictionary は順序非保持なので、常に
@@ -321,7 +369,14 @@ struct TaskDetailView: View {
         for task in appState.tasks where appState.activeSurfaces[task.id] != nil {
             ids.append(task.id)
         }
-        ids.append(contentsOf: appState.shellTabOrder)
+        // 全タスクの shell tabs も同じく決定的順序で (arrays 側で並びを
+        // 管理しているので enumerate は辞書の UUID ソート順依存にせず、
+        // tasks 配列順 → その task の shell 配列順、と層化する)。
+        for task in appState.tasks {
+            if let order = appState.shellTabOrderByTaskID[task.id] {
+                ids.append(contentsOf: order)
+            }
+        }
         return ids
     }
 
@@ -329,7 +384,7 @@ struct TaskDetailView: View {
     /// libghostty が二重 attach で壊れるため、activeLeftID に一致するタブは
     /// リストから除外 (右で使いたければ、まず左で別タブに切り替えてから選ぶ)。
     private var rightPaneTabBar: some View {
-        let candidates = appState.shellTabOrder.enumerated().filter { _, id in id != activeLeftID }
+        let candidates = currentTaskShellIDs.enumerated().filter { _, id in id != activeLeftID }
         return HStack(spacing: 4) {
             ForEach(Array(candidates), id: \.element) { index, shellID in
                 Button {
@@ -413,7 +468,7 @@ struct TaskDetailView: View {
                     planningBody(for: task)
                 case .done:
                     doneBody(for: task)
-                case .review, .inProgress:
+                case .review, .inProgress, .qa:
                     // resumeTask が非同期で走っている最中に一瞬だけ見える。
                     // `wt list` fallback を含めても数十 ms〜1 秒程度なので、
                     // 専用スピナーは入れず「復元中」だけ見せる。wt が無い /
@@ -431,15 +486,9 @@ struct TaskDetailView: View {
 
     @ViewBuilder
     private func planningBody(for task: TaskCard) -> some View {
-        Hand("Claude prompt", size: 16, weight: .bold)
-        Squiggle(width: 80)
-        Text(task.body.isEmpty ? "(まだプロンプト未設定)" : task.body)
-            .font(WFFont.mono(12))
-            .foregroundStyle(WF.ink)
-            .textSelection(.enabled)
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .sketchBox(fill: WF.paperAlt, radius: 8, shadow: false)
+        // planning ステージ専用の編集パネル。task.id で識別して、
+        // 選択中タスクが切り替わったら draft がリセットされるようにする。
+        PlanningEditorFields(task: task).id(task.id)
 
         if let needs = task.needs, !needs.isEmpty {
             Hand("Needs before start", size: 13, color: WF.ink2)
@@ -451,30 +500,49 @@ struct TaskDetailView: View {
             }
         }
 
-        HStack(spacing: 10) {
-            Button {
-                isStarting = true
-                Task {
-                    await appState.startTask(task)
-                    isStarting = false
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    if isStarting {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "play.fill")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    isStarting = true
+                    Task {
+                        await appState.startTask(task)
+                        isStarting = false
                     }
-                    Hand(isStarting ? "Starting…" : "Start", size: 13, color: WF.paper)
+                } label: {
+                    HStack(spacing: 6) {
+                        if isStarting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: "play.fill")
+                        }
+                        Hand(isStarting ? "Starting…" : "Start", size: 13, color: WF.paper)
+                    }
+                    .padding(.horizontal, 14).padding(.vertical, 6)
+                    .background(WF.ink, in: RoundedRectangle(cornerRadius: 8))
                 }
-                .padding(.horizontal, 14).padding(.vertical, 6)
-                .background(WF.ink, in: RoundedRectangle(cornerRadius: 8))
-            }
-            .buttonStyle(.plain)
-            .disabled(!canStart(task))
-            .help(startHelpText(task))
+                .buttonStyle(.plain)
+                .disabled(!canStart(task))
+                .help(startHelpText(task))
 
-            deleteButton(for: task)
+                deleteButton(for: task)
+            }
+
+            // Start 中は wt / hook の最新行を小さく表示して「今なにが走っているか」
+            // をユーザーに見せる。bun install / uv sync 等の実行中、固まっているの
+            // ではないことが分かる。非表示時は .empty で高さを占有しないように。
+            if let progress = appState.startProgressByTaskID[task.id] {
+                HStack(spacing: 6) {
+                    Image(systemName: "terminal")
+                        .font(.system(size: 10))
+                        .foregroundStyle(WF.ink3)
+                    Text(progress)
+                        .font(WFFont.mono(10))
+                        .foregroundStyle(WF.ink2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .transition(.opacity)
+            }
         }
         .padding(.top, 6)
     }
@@ -482,52 +550,50 @@ struct TaskDetailView: View {
     /// 全 stage で使い回す削除ボタン。Delete は worktree remove と surface
     /// teardown を伴うため async。dirty worktree の場合は確認 alert を
     /// 挟んでから実行する (誤削除で uncommitted change を失う事故を防ぐ)。
+    ///
+    /// 処理中 (`appState.deletingTaskIDs.contains(task.id)`) は spinner +
+    /// 「Deleting…」ラベル + disable。`wt remove` + surface teardown で
+    /// 1 秒〜数秒かかることがあり、ここでフィードバックを返さないと
+    /// ユーザーは「クリックが効かなかった」と誤認する。
     @ViewBuilder
     private func deleteButton(for task: TaskCard) -> some View {
+        let isDeleting = appState.deletingTaskIDs.contains(task.id)
         Button(role: .destructive) {
             Task { await requestDelete(task: task) }
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: "trash")
-                Hand("Delete", size: 12, color: WF.pink)
+                if isDeleting {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.7)
+                        .frame(width: 12, height: 12)
+                    Hand("Deleting…", size: 12, color: WF.pink)
+                } else {
+                    Image(systemName: "trash")
+                    Hand("Delete", size: 12, color: WF.pink)
+                }
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(WF.pink.opacity(0.5), lineWidth: 1.2))
         }
         .buttonStyle(.plain)
-        .alert(
-            "未コミットの変更があります",
-            isPresented: Binding(
-                get: { pendingDeleteTaskID != nil },
-                set: { if !$0 { pendingDeleteTaskID = nil } }
-            ),
-            presenting: pendingDeleteTaskID
-        ) { id in
-            Button("削除する", role: .destructive) {
-                onClose()
-                Task { await appState.deleteTask(id: id) }
-                pendingDeleteTaskID = nil
-            }
-            Button("キャンセル", role: .cancel) {
-                pendingDeleteTaskID = nil
-            }
-        } message: { _ in
-            Text("\(pendingDeleteDirPath) に未コミットの変更があります。削除するとこの変更は失われます。")
-        }
+        .disabled(isDeleting)
+        .opacity(isDeleting ? 0.6 : 1)
     }
 
-    /// Delete ボタン押下時のエントリ。dirty なら confirm alert、clean なら即削除。
-    /// dirty 判定は git status --porcelain で、worktree 無し / planning などは
-    /// 全て clean 扱い (即削除)。
+    /// Delete ボタン押下時のエントリ。dirty 判定と実行は
+    /// `AppState.requestDelete` に委譲。clean ならそのまま削除が走るので
+    /// モーダルは即閉じる。dirty なら pendingDeleteConfirmation が立って
+    /// ContentView の alert が出る — alert の「削除する」から完遂するので
+    /// この時点ではモーダルを閉じない (閉じると alert が dismiss してしまう
+    /// 可能性があるため、ContentView 側の alert handler でクローズする)。
     @MainActor
     private func requestDelete(task: TaskCard) async {
-        if let dirtyURL = await appState.checkWorktreeDirty(task: task) {
-            pendingDeleteDirPath = dirtyURL.lastPathComponent
-            pendingDeleteTaskID = task.id
-        } else {
+        let hadDirty = await appState.checkWorktreeDirty(task: task) != nil
+        if !hadDirty {
             onClose()
-            await appState.deleteTask(id: task.id)
         }
+        await appState.requestDelete(id: task.id)
     }
 
     @ViewBuilder
@@ -544,7 +610,7 @@ struct TaskDetailView: View {
                     Metric(label: "merged", value: merged)
                 }
                 Metric(label: "branch",
-                       value: task.branch.replacingOccurrences(of: "kanbario/", with: ""))
+                       value: task.displayBranch)
             }
         }
 
@@ -553,6 +619,7 @@ struct TaskDetailView: View {
             Text(task.body)
                 .font(WFFont.mono(12))
                 .foregroundStyle(WF.ink2)
+                .textSelection(.enabled)
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .sketchBox(fill: WF.paperAlt, radius: 8, shadow: false)
@@ -570,6 +637,7 @@ struct TaskDetailView: View {
         if !task.body.isEmpty {
             Text(task.body)
                 .font(WFFont.mono(12))
+                .textSelection(.enabled)
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .sketchBox(fill: WF.paperAlt, radius: 8, shadow: false)
@@ -614,7 +682,7 @@ struct TaskDetailView: View {
     }
 
     private var tabSummary: String {
-        let shells = appState.shellTabOrder.count
+        let shells = currentTaskShellIDs.count
         let base = shells + (appState.selectedTaskID.flatMap { appState.activeSurfaces[$0] } != nil ? 1 : 0)
         if base == 0 { return "" }
         return "\(base) tab\(base > 1 ? "s" : "")" + (appState.isTerminalExpanded ? " · split view" : "")
@@ -631,6 +699,124 @@ struct TaskDetailView: View {
         if !appState.canStartTasks { return "Choose a repository first (toolbar)" }
         if isStarting { return "Starting…" }
         return "Start Claude (wt switch + claude spawn)"
+    }
+}
+
+// MARK: - InlineTitleField
+
+/// タスクタイトルを title bar 内で直接編集できる小さな TextField。
+///
+/// **設計意図:**
+/// - 全ステージ (planning/inProgress/review/done) で編集可能 — ユーザーが
+///   タスク名を後から整理したくなるのは自然な運用。
+/// - 見た目は元の Hand (handwriting bold) と揃えて、外側の枠や背景を付けない
+///   plain スタイル。既存 UI から「普通のテキスト」と区別がつかない自然さが
+///   inline edit の要点。
+/// - 親 view は `.id(task.id)` を付与してタスク切替時に @State をリセットする。
+fileprivate struct InlineTitleField: View {
+    @Environment(AppState.self) private var appState
+    let task: TaskCard
+    @State private var draft: String
+
+    init(task: TaskCard) {
+        self.task = task
+        // **重要:** @State の初期値は init で注入する。onAppear で代入する
+        // 旧実装だと "" → task.title の変化が onChange を発火させ、
+        // updateTitle が updatedAt を書き換え、tasks(in:) の並び順が狂う
+        // (ユーザーが「カードを選ぶたびに順番が変わる」と感じる原因)。
+        _draft = State(initialValue: task.title)
+    }
+
+    var body: some View {
+        TextField("", text: $draft, prompt: Text("Title"))
+            .textFieldStyle(.plain)
+            .font(WFFont.hand(15, weight: .bold))
+            .foregroundStyle(WF.ink)
+            .fixedSize(horizontal: false, vertical: true)
+            .onChange(of: draft) { _, new in
+                // init で初期化済のため通常の初回発火は起きないが、
+                // SwiftUI 再描画経路での冗長発火を念のため等価チェックで弾く。
+                // これで「編集していないのに updatedAt が更新される」事故を
+                // 完全に防げる。
+                if new == task.title { return }
+                appState.updateTitle(id: task.id, title: new)
+            }
+    }
+}
+
+// MARK: - PlanningEditorFields
+
+/// planning ステージ限定の prompt / branch 編集パネル。Claude が起動する前
+/// なので、ここでの書き換えは worktree 整合性と衝突しない。
+/// 入力イベントごとに appState.updateBody / updateBranch を叩いて永続化する
+/// (debounce なし — macOS の atomic write はサイズ小なら十分速い)。
+fileprivate struct PlanningEditorFields: View {
+    @Environment(AppState.self) private var appState
+    let task: TaskCard
+    @State private var bodyDraft: String
+    @State private var branchDraft: String
+
+    init(task: TaskCard) {
+        self.task = task
+        // **重要:** @State を init で直接注入。onAppear による遅延代入は
+        // 変化として onChange を発火させ、updateBody / updateBranch 経由で
+        // updatedAt を書き換えてカード並び順を乱す。
+        _bodyDraft = State(initialValue: task.body)
+        _branchDraft = State(initialValue: task.branch)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            promptBlock
+            branchBlock
+        }
+    }
+
+    @ViewBuilder
+    private var promptBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Hand("Claude prompt", size: 16, weight: .bold)
+            Squiggle(width: 80)
+            TextEditor(text: $bodyDraft)
+                .font(WFFont.mono(12))
+                .foregroundStyle(WF.ink)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(WF.paperAlt)
+                .frame(minHeight: 140)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(WF.line, lineWidth: 1.3)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .onChange(of: bodyDraft) { _, new in
+                    // 冗長発火ガード (並び順保護)
+                    if new == task.body { return }
+                    appState.updateBody(id: task.id, body: new)
+                }
+        }
+    }
+
+    @ViewBuilder
+    private var branchBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Hand("Branch", size: 12, color: WF.ink2)
+            TextField("kanbario/...", text: $branchDraft)
+                .textFieldStyle(.plain)
+                .font(WFFont.mono(12))
+                .foregroundStyle(WF.ink)
+                .padding(8)
+                .background(WF.paperAlt, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(WF.line, lineWidth: 1.2)
+                )
+                .onChange(of: branchDraft) { _, new in
+                    // 冗長発火ガード (並び順保護)
+                    if new == task.branch { return }
+                    appState.updateBranch(id: task.id, branch: new)
+                }
+        }
     }
 }
 
