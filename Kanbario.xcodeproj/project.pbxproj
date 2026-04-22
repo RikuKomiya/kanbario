@@ -8,46 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		F281B25A2F94025200856A2D /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F281B2592F94025200856A2D /* GhosttyKit.xcframework */; };
-		F281B4012F94900000856A2D /* claude in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B4002F94900000856A2D /* claude */; };
+		F281B4012F94900000856A2D /* Resources/bin/claude in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B4002F94900000856A2D /* Resources/bin/claude */; };
 		F281B4022F94900000856A2D /* kanbario in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B3042F94800000856A2D /* kanbario */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 /* End PBXBuildFile section */
-
-/* Begin PBXCopyFilesBuildPhase section */
-		F281B4032F94900000856A2D /* Copy Hook Bin */ = {
-			isa = PBXCopyFilesBuildPhase;
-			buildActionMask = 2147483647;
-			dstPath = bin;
-			dstSubfolderSpec = 7;
-			files = (
-				F281B4012F94900000856A2D /* claude in Copy Hook Bin */,
-				F281B4022F94900000856A2D /* kanbario in Copy Hook Bin */,
-			);
-			name = "Copy Hook Bin";
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-/* End PBXCopyFilesBuildPhase section */
-
-/* Begin PBXShellScriptBuildPhase section */
-		F281CAFE010000000000001A /* Copy Ghostty Terminfo */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-			);
-			name = "Copy Ghostty Terminfo";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "set -eu\n# Copy ghostty terminfo (xterm-ghostty + xterm-256color) into the app bundle.\n# scripts/ensure-ghosttykit.sh puts the real files at Resources/terminfo.\nSRC=\"${PROJECT_DIR}/Resources/terminfo\"\nDST=\"${TARGET_BUILD_DIR}/${WRAPPER_NAME}/Contents/Resources/terminfo\"\nif [ -d \"$SRC\" ]; then\n    rm -rf \"$DST\"\n    mkdir -p \"$DST\"\n    # rsync is more forgiving than cp in the Xcode sandbox and will happily\n    # traverse a source tree with mixed file/dir permissions.\n    /usr/bin/rsync -aL --delete \"$SRC/\" \"$DST/\"\n    echo \"Copied ghostty terminfo to $DST ($(ls \"$DST\" | wc -l | tr -d ' ') entries)\"\nelse\n    echo \"warning: $SRC not found; skipping terminfo copy\"\nfi\n";
-		};
-/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXContainerItemProxy section */
 		F281B2012F93787E00856A2D /* PBXContainerItemProxy */ = {
@@ -73,13 +36,28 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXCopyFilesBuildPhase section */
+		F281B4032F94900000856A2D /* Copy Hook Bin */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = bin;
+			dstSubfolderSpec = 7;
+			files = (
+				F281B4012F94900000856A2D /* Resources/bin/claude in Copy Hook Bin */,
+				F281B4022F94900000856A2D /* kanbario in Copy Hook Bin */,
+			);
+			name = "Copy Hook Bin";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		F281B1F32F93787C00856A2D /* Kanbario.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Kanbario.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F281B2002F93787E00856A2D /* KanbarioTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KanbarioTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F281B20A2F93787F00856A2D /* KanbarioUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KanbarioUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F281B2592F94025200856A2D /* GhosttyKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = GhosttyKit.xcframework; sourceTree = SOURCE_ROOT; };
 		F281B3042F94800000856A2D /* kanbario */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = kanbario; sourceTree = BUILT_PRODUCTS_DIR; };
-		F281B4002F94900000856A2D /* claude */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.sh; path = "Resources/bin/claude"; sourceTree = "<group>"; };
+		F281B4002F94900000856A2D /* Resources/bin/claude */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.sh; path = Resources/bin/claude; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -143,7 +121,7 @@
 			children = (
 				F281B1F52F93787C00856A2D /* Kanbario */,
 				F281B3032F94800000856A2D /* CLI */,
-				F281B4002F94900000856A2D /* claude */,
+				F281B4002F94900000856A2D /* Resources/bin/claude */,
 				F281B2032F93787E00856A2D /* KanbarioTests */,
 				F281B20D2F93787F00856A2D /* KanbarioUITests */,
 				F281B2582F94025200856A2D /* Frameworks */,
@@ -337,6 +315,28 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		F281CAFE010000000000001A /* Copy Ghostty Terminfo */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Copy Ghostty Terminfo";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\n# Copy ghostty terminfo (xterm-ghostty + xterm-256color) into the app bundle.\n# scripts/ensure-ghosttykit.sh puts the real files at Resources/terminfo.\nSRC=\"${PROJECT_DIR}/Resources/terminfo\"\nDST=\"${TARGET_BUILD_DIR}/${WRAPPER_NAME}/Contents/Resources/terminfo\"\nif [ -d \"$SRC\" ]; then\n    rm -rf \"$DST\"\n    mkdir -p \"$DST\"\n    # rsync is more forgiving than cp in the Xcode sandbox and will happily\n    # traverse a source tree with mixed file/dir permissions.\n    /usr/bin/rsync -aL --delete \"$SRC/\" \"$DST/\"\n    echo \"Copied ghostty terminfo to $DST ($(ls \"$DST\" | wc -l | tr -d ' ') entries)\"\nelse\n    echo \"warning: $SRC not found; skipping terminfo copy\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		F281B1EF2F93787C00856A2D /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -381,7 +381,7 @@
 		};
 		F281B4042F94900000856A2D /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = F281B3002F94800000856A2D /* kanbario */;
+			target = F281B3002F94800000856A2D /* KanbarioCLI */;
 			targetProxy = F281B4052F94900000856A2D /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */

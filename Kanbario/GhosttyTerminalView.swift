@@ -986,15 +986,27 @@ struct GhosttyTerminalView: NSViewRepresentable {
         // makeFirstResponder 呼び出しを避ける (IME composition 中などに
         // firstResponder をつけ直すと marked text が壊れる)。
         //
+        // **重要:** TextField / TextEditor を編集中は first responder が
+        // その field editor (NSText / NSTextView) になっている。updateNSView
+        // は SwiftUI の state 更新ごとに走るため、そのタイミングで無条件に
+        // terminal に focus を奪い返すと、TextField に打つたびカーソルが
+        // terminal に飛び、IME が途切れて 1 文字で止まる。同一ウィンドウ内で
+        // 上位 SwiftUI が提供する text 編集要素には譲る方針に切り替える。
+        //
         // 初回 updateNSView 時点では nsView.window がまだ nil のことがある
         // (SwiftUI の NSViewRepresentable は makeNSView → updateNSView →
         // superview 追加 → viewDidMoveToWindow の順)。その場合は main queue
         // 上で 1 ターン遅延させて再試行する。
         if isSelected {
             let promote: () -> Void = {
-                if let window = nsView.window, window.firstResponder !== nsView {
-                    window.makeFirstResponder(nsView)
-                }
+                guard let window = nsView.window,
+                      window.firstResponder !== nsView
+                else { return }
+                // text 編集中 (field editor / NSTextView) の時は奪わない。
+                // 次に terminal area を click or タブ切替時は別経路で
+                // makeFirstResponder が呼ばれるので、ここで譲っても問題ない。
+                if Self.isTextEditingResponder(window.firstResponder) { return }
+                window.makeFirstResponder(nsView)
             }
             if nsView.window != nil {
                 promote()
@@ -1016,5 +1028,23 @@ struct GhosttyTerminalView: NSViewRepresentable {
         MainActor.assumeIsolated {
             nsView.teardown()
         }
+    }
+
+    /// 現在の firstResponder が「ユーザーが text 編集中の AppKit view」か判定する。
+    ///
+    /// - `NSText` / `NSTextView`: SwiftUI の `TextField` / `TextEditor` が使う
+    ///   field editor / 入力ビュー。NSTextView は NSText のサブクラスなので
+    ///   `is NSText` で両方カバーできる。
+    /// - AppKit の `NSTextField` / `NSSearchField` が first responder を名乗る
+    ///   フレームだと、内部 field editor ではなく自身が firstResponder と
+    ///   報告されるケースがあるため、念のため NSControl 系も見る。
+    ///
+    /// 該当すれば terminal は focus を奪いに行かない。
+    fileprivate static func isTextEditingResponder(_ responder: NSResponder?) -> Bool {
+        guard let responder else { return false }
+        if responder is NSText { return true }                 // NSTextView 含む
+        if responder is NSTextField { return true }
+        if responder is NSSearchField { return true }
+        return false
     }
 }

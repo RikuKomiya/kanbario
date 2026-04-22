@@ -33,7 +33,8 @@ enum ClaudeSessionFactory {
         task: TaskCard,
         worktreeURL: URL,
         claudeExecutable: URL? = nil,
-        resume: Bool = false
+        resume: Bool = false,
+        autoMode: Bool = false
     ) throws -> TerminalSurface {
         // Bundle 同梱の shim (Resources/bin/claude) を最優先で起動する。
         // shim が --settings で hook を注入し、内部で real claude を exec
@@ -113,16 +114,23 @@ enum ClaudeSessionFactory {
         //   の augmentedPATH が mise/asdf 等の shim パスを補填している。
         // - exec: claude で shell を置換して PID を 1 段減らし、Stop ボタンの
         //   SIGHUP 伝播経路を変えない
+        // autoMode = true の場合、claude に `--permission-mode bypassPermissions`
+        // を付けて tool 承認プロンプトを全スキップする。kanbario 内で動かす
+        // 前提の運用想定で、承認ダイアログで止まる UX を避ける。
+        // 注意: これは `--dangerously-skip-permissions` と同等の効果で、
+        // prompt で `rm -rf` 等も実行されるので開発環境での使用に限る。
+        let permissionFlag = autoMode ? " --permission-mode bypassPermissions" : ""
+
         let claudeInvocation: String
         if resume {
             // --continue はこの cwd (= worktree) の最新会話を読み直す。
             // kanbario は task 1 つに worktree 1 つなので session-id を
             // 引数で指定する必要はない (--resume <id> ではなく --continue)。
-            claudeInvocation = "\(shellQuote(executable.path)) --continue"
+            claudeInvocation = "\(shellQuote(executable.path))\(permissionFlag) --continue"
         } else if task.body.isEmpty {
-            claudeInvocation = shellQuote(executable.path)
+            claudeInvocation = "\(shellQuote(executable.path))\(permissionFlag)"
         } else {
-            claudeInvocation = "\(shellQuote(executable.path)) \(shellQuote(task.body))"
+            claudeInvocation = "\(shellQuote(executable.path))\(permissionFlag) \(shellQuote(task.body))"
         }
         let userShell = env["SHELL"] ?? "/bin/zsh"
         let commandLine = "\(shellQuote(userShell)) -l -c \(shellQuote("exec " + claudeInvocation))"

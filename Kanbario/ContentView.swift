@@ -12,12 +12,17 @@ import AppKit
 /// SIGHUP で殺される (PR #4 の根本原因と同じ罠)。
 struct ContentView: View {
     @Environment(AppState.self) private var appState
-    @State private var isShowingNewTask = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        // NewTaskSheet 表示 state を AppState 側で管理 (App 全体の Commands
+        // menu ⌘N からも切り替えられるようにするため)。@Bindable で
+        // `$appState.showingNewTaskSheet` として .sheet に渡す。
+        @Bindable var state = appState
+
         ZStack {
             // ── 下層: ボード
-            KanbanBoardView(onNewTask: { isShowingNewTask = true })
+            KanbanBoardView(onNewTask: { appState.showingNewTaskSheet = true })
                 .opacity(isModalOpen ? 0.45 : 1)
                 .allowsHitTesting(!isModalOpen)
                 .animation(.smooth(duration: 0.22), value: isModalOpen)
@@ -37,8 +42,17 @@ struct ContentView: View {
             ToolbarItem(placement: .principal) {
                 repoChip
             }
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    openWindow(id: "project-shell")
+                } label: {
+                    Image(systemName: "chevron.left.forwardslash.chevron.right")
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .help("Open Project Shell (⌘⇧T) — task と無関係な、プロジェクト大元の shell")
+            }
         }
-        .sheet(isPresented: $isShowingNewTask) {
+        .sheet(isPresented: $state.showingNewTaskSheet) {
             NewTaskSheet()
         }
         .alert(
@@ -52,6 +66,29 @@ struct ContentView: View {
             Button("OK", role: .cancel) { appState.lastError = nil }
         } message: { error in
             Text(error)
+        }
+        // カード context menu / モーダルの Delete ボタン、どちらから
+        // 呼ばれても dirty 判定で pending を立てるのは AppState.requestDelete。
+        // 実際の確認 alert は一箇所にまとめて ContentView で出す (複数箇所に
+        // 散らすと、モーダルが閉じた瞬間に alert も消えるなど UX が壊れる)。
+        .alert(
+            "未コミットの変更があります",
+            isPresented: Binding(
+                get: { appState.pendingDeleteConfirmation != nil },
+                set: { if !$0 { appState.cancelPendingDelete() } }
+            ),
+            presenting: appState.pendingDeleteConfirmation
+        ) { pending in
+            Button("削除する", role: .destructive) {
+                appState.selectedTaskID = nil
+                appState.isTerminalExpanded = false
+                Task { await appState.confirmPendingDelete() }
+            }
+            Button("キャンセル", role: .cancel) {
+                appState.cancelPendingDelete()
+            }
+        } message: { pending in
+            Text("\(pending.worktreeDirName) に未コミットの変更があります。削除するとこの変更は失われます。")
         }
         // ESC = modal close は意図的に未実装。ESC は terminal に素通しして
         // claude / vim / less の interrupt キーとして機能させる。ESC による
@@ -69,6 +106,11 @@ struct ContentView: View {
 
     /// wireframe の半透明 backdrop + ぼかし + 中央モーダルを再現。
     /// backdropFilter: blur(8px) は `.background(.ultraThinMaterial)` で近似。
+    ///
+    /// **サイズ:** ほぼフル画面 (margin のみ残す)。旧版は maxWidth 1240 /
+    /// maxHeight 820 で固定サイズ中央置きだったが、terminal を表示する用途
+    /// (inProgress / review) ではできるだけ広い方が読みやすい。planning /
+    /// done ではこの広さでも placeholder が中央上寄せで自然に見える。
     private var modalLayer: some View {
         ZStack {
             // backdrop (タップで閉じる)
@@ -79,8 +121,8 @@ struct ContentView: View {
                 .onTapGesture { closeModal() }
 
             TaskDetailView(onClose: closeModal)
-                .frame(maxWidth: 1240, maxHeight: 820)
-                .padding(28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(16)
         }
     }
 
