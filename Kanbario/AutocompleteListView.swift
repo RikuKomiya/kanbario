@@ -97,6 +97,11 @@ struct PromptEditorWithAutocomplete: View {
     let files: [FileEntry]
     /// `/` で検索する候補 (skills + commands)。
     let slashes: [SlashEntry]
+    /// Markdown toolbar など、親 view から native text operation を実行したい時に渡す。
+    var handle: PromptEditorHandle? = nil
+    var minHeight: CGFloat = 120
+    var emptyTabInsertion: String? = nil
+    var droppedItemFormatter: (([PromptDroppedItem]) -> PromptTextInsertion?)? = nil
 
     /// trigger 状態 (PromptEditor が通知する)。popup の表示判定に使う。
     @State private var trigger: TriggerContext? = nil
@@ -106,7 +111,11 @@ struct PromptEditorWithAutocomplete: View {
     @State private var selectedIndex: Int = 0
     /// NSTextView を直接操作するための handle。@ commit 時に SwiftUI Binding
     /// 経由の全文 replace を避けて、IME marked text / cursor 位置を壊さない。
-    @State private var editorHandle = PromptEditorHandle()
+    @State private var localEditorHandle = PromptEditorHandle()
+
+    private var activeEditorHandle: PromptEditorHandle {
+        handle ?? localEditorHandle
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -118,9 +127,12 @@ struct PromptEditorWithAutocomplete: View {
                     cursorRect = rect
                 },
                 onNavigationKey: handleNavigationKey(_:),
-                handle: editorHandle
+                handle: activeEditorHandle,
+                droppedItemFormatter: droppedItemFormatter,
+                emptyTabInsertion: emptyTabInsertion,
+                minHeight: minHeight
             )
-            .frame(minHeight: 120)
+            .frame(minHeight: minHeight)
 
             if let trigger, !currentFilteredItems(for: trigger).isEmpty {
                 popupOverlay(trigger: trigger)
@@ -235,7 +247,7 @@ struct PromptEditorWithAutocomplete: View {
         )
         // 挿入後に space を付けて「次の語」に自然に移れるようにする。
         let replacement = insertionText + " "
-        editorHandle.replaceRange(safeRange, with: replacement)
+        activeEditorHandle.replaceRange(safeRange, with: replacement)
         self.trigger = nil
         self.selectedIndex = 0
     }

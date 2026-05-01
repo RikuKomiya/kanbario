@@ -20,18 +20,218 @@ import AppKit
 /// - `selectedRange` が (0,0) にリセットされ cursor が文頭へ戻る
 /// - IME input context が失われる
 /// という副作用があるので、commit のような小さな range 置換は native 経路を使う。
+struct PromptTextInsertion {
+    let text: String
+    let appendix: String?
+
+    init(text: String, appendix: String? = nil) {
+        self.text = text
+        self.appendix = appendix
+    }
+}
+
+enum PromptDroppedItem {
+    case file(URL)
+    case url(URL)
+    case text(String)
+}
+
 final class PromptEditorHandle {
     fileprivate weak var textView: NSTextView?
 
     /// 指定 range を string で置き換え、cursor を置換文字列の末尾に移す。
     /// undo stack にも入る (shouldChangeText を経由するため)。
-    func replaceRange(_ range: NSRange, with string: String) {
+    func replaceRange(
+        _ range: NSRange,
+        with string: String,
+        selectedRangeAfter: NSRange? = nil
+    ) {
         guard let tv = textView else { return }
-        guard tv.shouldChangeText(in: range, replacementString: string) else { return }
-        tv.replaceCharacters(in: range, with: string)
+        let ns = tv.string as NSString
+        let location = min(max(range.location, 0), ns.length)
+        let length = min(max(range.length, 0), ns.length - location)
+        let safeRange = NSRange(location: location, length: length)
+        guard tv.shouldChangeText(in: safeRange, replacementString: string) else { return }
+        tv.window?.makeFirstResponder(tv)
+        tv.replaceCharacters(in: safeRange, with: string)
         tv.didChangeText()
-        let newCursor = range.location + (string as NSString).length
-        tv.setSelectedRange(NSRange(location: newCursor, length: 0))
+        let newCursor = safeRange.location + (string as NSString).length
+        let rawNextRange = selectedRangeAfter ?? NSRange(location: newCursor, length: 0)
+        let updatedLength = (tv.string as NSString).length
+        let nextLocation = min(max(rawNextRange.location, 0), updatedLength)
+        let nextLength = min(max(rawNextRange.length, 0), updatedLength - nextLocation)
+        let safeNextRange = NSRange(location: nextLocation, length: nextLength)
+        tv.setSelectedRange(safeNextRange)
+        tv.scrollRangeToVisible(safeNextRange)
+    }
+
+    func insertText(_ string: String) {
+        insert(PromptTextInsertion(text: string))
+    }
+
+    func insert(_ insertion: PromptTextInsertion) {
+        guard let tv = textView else { return }
+        Self.insert(insertion, into: tv, at: tv.selectedRange())
+    }
+
+    func focus() {
+        guard let tv = textView else { return }
+        tv.window?.makeFirstResponder(tv)
+    }
+
+    func wrapSelection(prefix: String, suffix: String, placeholder: String) {
+        guard let tv = textView else { return }
+        let range = tv.selectedRange()
+        let selected = selectedText(in: tv)
+        let content = selected.isEmpty ? placeholder : selected
+        let replacement = "\(prefix)\(content)\(suffix)"
+        let prefixLength = (prefix as NSString).length
+        let selection = NSRange(
+            location: range.location + prefixLength,
+            length: (content as NSString).length
+        )
+        replaceRange(range, with: replacement, selectedRangeAfter: selection)
+    }
+
+    func prefixSelectedLines(with prefix: String, placeholder: String) {
+        guard let tv = textView else { return }
+        let range = tv.selectedRange()
+        if range.length == 0 {
+            let replacement = "\(prefix)\(placeholder)"
+            let selection = NSRange(
+                location: range.location + (prefix as NSString).length,
+                length: (placeholder as NSString).length
+            )
+            replaceRange(range, with: replacement, selectedRangeAfter: selection)
+            return
+        }
+
+        let ns = tv.string as NSString
+        let paragraphRange = ns.paragraphRange(for: range)
+        let chunk = ns.substring(with: paragraphRange)
+        let lines = chunk.components(separatedBy: "\n")
+        let hasTrailingNewline = chunk.hasSuffix("\n")
+        let prefixed = lines.enumerated().map { index, line in
+            if index == lines.count - 1, line.isEmpty, hasTrailingNewline {
+                return ""
+            }
+            return line.isEmpty ? prefix.trimmingCharacters(in: .whitespaces) : "\(prefix)\(line)"
+        }.joined(separator: "\n")
+        replaceRange(
+            paragraphRange,
+            with: prefixed,
+            selectedRangeAfter: NSRange(location: paragraphRange.location, length: (prefixed as NSString).length)
+        )
+    }
+
+    func insertCodeBlock(language: String = "", placeholder: String = "code") {
+        guard let tv = textView else { return }
+        let range = tv.selectedRange()
+        let selected = selectedText(in: tv)
+        let content = selected.isEmpty ? placeholder : selected
+        let replacement = "```\(language)\n\(content)\n```"
+        let selection = selected.isEmpty
+            ? NSRange(location: range.location + 4 + (language as NSString).length, length: (content as NSString).length)
+            : NSRange(location: range.location + (replacement as NSString).length, length: 0)
+        replaceRange(range, with: replacement, selectedRangeAfter: selection)
+    }
+
+    func insertMarkdownLink(
+        title: String? = nil,
+        destination: String,
+        selectDestination: Bool = false
+    ) {
+        guard let tv = textView else { return }
+        let range = tv.selectedRange()
+        let selected = selectedText(in: tv)
+        let label = {
+            if let title, !title.isEmpty { return title }
+            return selected.isEmpty ? "link text" : selected
+        }()
+        let replacement = "[\(label)](\(destination))"
+        let selection: NSRange
+        if selectDestination {
+            selection = NSRange(
+                location: range.location + ("[\(label)](" as NSString).length,
+                length: (destination as NSString).length
+            )
+        } else if selected.isEmpty {
+            selection = NSRange(location: range.location + 1, length: (label as NSString).length)
+        } else {
+            selection = NSRange(location: range.location + (replacement as NSString).length, length: 0)
+        }
+        replaceRange(range, with: replacement, selectedRangeAfter: selection)
+    }
+
+    func insertMarkdownImage(
+        alt: String = "image",
+        source: String,
+        selectSource: Bool = false
+    ) {
+        guard let tv = textView else { return }
+        let range = tv.selectedRange()
+        let selected = selectedText(in: tv)
+        let altText = selected.isEmpty ? alt : selected
+        let replacement = "![\(altText)](\(source))"
+        let selection = selectSource
+            ? NSRange(location: range.location + ("![\(altText)](" as NSString).length,
+                      length: (source as NSString).length)
+            : NSRange(location: range.location + (replacement as NSString).length, length: 0)
+        replaceRange(range, with: replacement, selectedRangeAfter: selection)
+    }
+
+    private func selectedText(in tv: NSTextView) -> String {
+        let ns = tv.string as NSString
+        let range = tv.selectedRange()
+        guard range.location >= 0,
+              range.location <= ns.length,
+              range.location + range.length <= ns.length else { return "" }
+        return ns.substring(with: range)
+    }
+
+    fileprivate static func insert(
+        _ insertion: PromptTextInsertion,
+        into tv: NSTextView,
+        at range: NSRange
+    ) {
+        let ns = tv.string as NSString
+        let location = min(max(range.location, 0), ns.length)
+        let length = min(max(range.length, 0), ns.length - location)
+        let safeRange = NSRange(location: location, length: length)
+
+        guard tv.shouldChangeText(in: safeRange, replacementString: insertion.text) else { return }
+        tv.window?.makeFirstResponder(tv)
+        tv.undoManager?.beginUndoGrouping()
+        tv.replaceCharacters(in: safeRange, with: insertion.text)
+        tv.didChangeText()
+
+        let inlineEnd = safeRange.location + (insertion.text as NSString).length
+        let desiredSelection = NSRange(location: inlineEnd, length: 0)
+
+        if let appendix = insertion.appendix, !appendix.isEmpty {
+            let current = tv.string
+            let separator: String
+            if current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                separator = ""
+            } else if current.hasSuffix("\n\n") {
+                separator = ""
+            } else if current.hasSuffix("\n") {
+                separator = "\n"
+            } else {
+                separator = "\n\n"
+            }
+            let appendixText = separator + appendix
+            let updatedLength = (tv.string as NSString).length
+            let endRange = NSRange(location: updatedLength, length: 0)
+            if tv.shouldChangeText(in: endRange, replacementString: appendixText) {
+                tv.replaceCharacters(in: endRange, with: appendixText)
+                tv.didChangeText()
+            }
+        }
+
+        tv.undoManager?.endUndoGrouping()
+        tv.setSelectedRange(desiredSelection)
+        tv.scrollRangeToVisible(desiredSelection)
     }
 }
 
@@ -48,6 +248,10 @@ struct PromptEditor: NSViewRepresentable {
 
     /// 外部から NSTextView を直接触りたい場合の handle。nil なら素の editor として動作。
     var handle: PromptEditorHandle? = nil
+    /// drag/drop や paste された URL / file を Markdown 挿入に変換する。
+    var droppedItemFormatter: (([PromptDroppedItem]) -> PromptTextInsertion?)? = nil
+    /// 空の editor で Tab を押した時に挿入する starter template。
+    var emptyTabInsertion: String? = nil
 
     var minHeight: CGFloat = 120
 
@@ -67,6 +271,8 @@ struct PromptEditor: NSViewRepresentable {
         let textView = AutocompleteTextView()
         textView.delegate = context.coordinator
         textView.autocompleteHandler = context.coordinator
+        textView.droppedItemFormatter = droppedItemFormatter
+        textView.emptyTabInsertion = emptyTabInsertion
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
@@ -110,6 +316,8 @@ struct PromptEditor: NSViewRepresentable {
         guard let tv = scroll.documentView as? AutocompleteTextView else { return }
         // handle が new SwiftUI snapshot で別インスタンスになった場合の保険。
         handle?.textView = tv
+        tv.droppedItemFormatter = droppedItemFormatter
+        tv.emptyTabInsertion = emptyTabInsertion
         // **IME composing 中は text 同期を skip**: hasMarkedText() = true の時
         // replaceCharacters すると marked text buffer が壊れて日本語入力が乱れる。
         // IME 確定後 (marked text が空になる) に textDidChange 経由で改めて同期される。
@@ -202,6 +410,8 @@ protocol AutocompleteKeyHandling: AnyObject {
 /// keyDown を intercept して autocomplete 側に選択キーを奪わせる NSTextView。
 final class AutocompleteTextView: NSTextView {
     weak var autocompleteHandler: AutocompleteKeyHandling?
+    var droppedItemFormatter: (([PromptDroppedItem]) -> PromptTextInsertion?)?
+    var emptyTabInsertion: String?
 
     override func keyDown(with event: NSEvent) {
         if let handler = autocompleteHandler {
@@ -220,6 +430,82 @@ final class AutocompleteTextView: NSTextView {
                 return  // autocomplete が食った = textview には流さない
             }
         }
+        if event.keyCode == 48,
+           let emptyTabInsertion,
+           string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let fullRange = NSRange(location: 0, length: (string as NSString).length)
+            PromptEditorHandle.insert(
+                PromptTextInsertion(text: emptyTabInsertion),
+                into: self,
+                at: fullRange
+            )
+            return
+        }
         super.keyDown(with: event)
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        canFormatDroppedItems(from: sender.draggingPasteboard)
+            ? .copy
+            : super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        canFormatDroppedItems(from: sender.draggingPasteboard)
+            ? .copy
+            : super.draggingUpdated(sender)
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let insertion = formattedInsertion(from: sender.draggingPasteboard) else {
+            return super.performDragOperation(sender)
+        }
+        let point = convert(sender.draggingLocation, from: nil)
+        let index = characterIndexForInsertion(at: point)
+        PromptEditorHandle.insert(
+            insertion,
+            into: self,
+            at: NSRange(location: index, length: 0)
+        )
+        return true
+    }
+
+    override func paste(_ sender: Any?) {
+        if let insertion = formattedInsertion(from: NSPasteboard.general) {
+            PromptEditorHandle.insert(insertion, into: self, at: selectedRange())
+            return
+        }
+        super.paste(sender)
+    }
+
+    private func canFormatDroppedItems(from pasteboard: NSPasteboard) -> Bool {
+        formattedInsertion(from: pasteboard) != nil
+    }
+
+    private func formattedInsertion(from pasteboard: NSPasteboard) -> PromptTextInsertion? {
+        guard let formatter = droppedItemFormatter else { return nil }
+        let items = Self.promptDroppedItems(from: pasteboard)
+        guard !items.isEmpty else { return nil }
+        return formatter(items)
+    }
+
+    private static func promptDroppedItems(from pasteboard: NSPasteboard) -> [PromptDroppedItem] {
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self]) as? [URL],
+           !urls.isEmpty {
+            return urls.map { $0.isFileURL ? .file($0) : .url($0) }
+        }
+
+        if let raw = pasteboard.string(forType: .URL),
+           let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+           url.scheme != nil {
+            return [url.isFileURL ? .file(url) : .url(url)]
+        }
+
+        if let raw = pasteboard.string(forType: .string),
+           !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return [.text(raw)]
+        }
+
+        return []
     }
 }
