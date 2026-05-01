@@ -136,6 +136,30 @@ final class AppState {
     /// session-end / performCleanup / handleSurfaceClosed で停止する。
     private var transcriptTailers: [UUID: TranscriptTailer] = [:]
 
+    /// taskID → 現在 tail している transcript ファイルの絶対パス。
+    /// `startTranscriptTail` が **異なるパス** で呼ばれたタイミング (= claude
+    /// --continue で新 session が切られた等) を検出して、前 session の
+    /// `activityLog` / `seenTranscriptLineUUIDs` を先にクリアするための鍵。
+    /// 同一パスでの stop → start (再 drain) では clear しないので、次の
+    /// dedup で old 行を静かに落とせる。
+    private var lastTranscriptPathByTaskID: [UUID: String] = [:]
+
+    /// taskID → 既に `activityLog` / `currentActivity` に反映済みの
+    /// transcript 行 `uuid` の集合。
+    ///
+    /// **なぜ必要か:** `TranscriptTailer.attachSource()` は open 直後に
+    /// ファイル先頭から全行 drain する設計なので、同じ transcript に対して
+    /// stop → start が走ると全行が再度 `onEvent` に流れる。そのままでは
+    /// `activityLog.append(entry)` / `updateCurrentActivity(...)` が二度
+    /// 走って live log が重複表示・turnStartedAt の誤リセット等を招く。
+    /// ここに既処理 uuid を貯めておき、再到来行は完全 skip する。
+    ///
+    /// **寿命:** performCleanup (タスク削除 / done) で taskID ごと drop、
+    /// および `startTranscriptTail` で transcript path が変わった時にも
+    /// clear (異 session では uuid 空間が別なので持ち越しても毒にしか
+    /// ならない)。メモリは 1 タスク数千 uuid でも数 MB 未満。
+    private var seenTranscriptLineUUIDs: [UUID: Set<String>] = [:]
+
     /// タスク単位で「今左ペインに表示すべき shell surface」の ID を保持する
     /// 辞書。キー = タスク ID、値 = shell UUID。
     ///
@@ -486,6 +510,10 @@ final class AppState {
         activityLog.removeValue(forKey: task.id)
         currentActivityByTaskID.removeValue(forKey: task.id)
         pendingPermissionByTaskID.removeValue(forKey: task.id)
+        // dedup state も落とす (次に同 taskID が再利用されることはないが、
+        // 整合性と fd 外の state leak 防止)。
+        lastTranscriptPathByTaskID.removeValue(forKey: task.id)
+        seenTranscriptLineUUIDs.removeValue(forKey: task.id)
 
         // タスクに紐づく shell タブも全て teardown する。cwd が worktree 内
         // にある可能性が高く、この後の `wt remove` で worktree dir 自体が
@@ -1232,16 +1260,47 @@ final class AppState {
     /// 新しい TranscriptTailer を起動し、activityLog と currentActivityByTaskID
     /// を更新する buffer として受ける。既に tailer が動いているタスクでは
     /// no-op (重複起動で log が二重化するのを防ぐ)。
+    ///
+    /// **重複防止の 2 段構え:**
+    /// 1. transcript path が前回と違う場合 = 別 session に切り替わった (例:
+    ///    auto-resume が `claude --continue` を叩いて新 session_id を作った)。
+    ///    新 file には前会話が別 uuid で replay されるので、前 session の
+    ///    `activityLog` を保持すると「旧 entry + replay entry」が意味的に
+    ///    二重化する。なので先にクリアしてから新 file を drain する。
+    /// 2. transcript path が同じ場合 = stop → start での再 drain。同じ行は
+    ///    同じ uuid で流れ直してくるので、`seenTranscriptLineUUIDs` で
+    ///    pre-filter して skip する。
     fileprivate func startTranscriptTail(
         taskID: UUID,
         transcriptURL: URL
     ) {
         guard transcriptTailers[taskID] == nil else { return }
+        let newPath = transcriptURL.path
+        if lastTranscriptPathByTaskID[taskID] != newPath {
+            activityLog.removeValue(forKey: taskID)
+            currentActivityByTaskID.removeValue(forKey: taskID)
+            seenTranscriptLineUUIDs.removeValue(forKey: taskID)
+        }
+        lastTranscriptPathByTaskID[taskID] = newPath
+
         let tailer = TranscriptTailer(transcriptURL: transcriptURL) { [weak self] entry, rawLine in
             // closure boundary を越えるのは Sendable な Data まで。
             // dict 化は MainActor 内で行う (Any の Sendable 違反を回避)。
             Task { @MainActor in
                 guard let self else { return }
+                let raw = (try? JSONSerialization.jsonObject(with: rawLine))
+                    as? [String: Any]
+                // uuid dedup: 再 drain された行はここで完全 skip。
+                // uuid 欠落行 (permission-mode / file-history-snapshot 等)
+                // は元々 buildEntry が nil を返すので append されない &
+                // updateCurrentActivity も分岐で落ちる → dedup 対象外で OK。
+                if let uuid = raw?["uuid"] as? String {
+                    var seen = self.seenTranscriptLineUUIDs[taskID] ?? []
+                    if seen.contains(uuid) { return }
+                    seen.insert(uuid)
+                    self.seenTranscriptLineUUIDs[taskID] = seen
+                }
+
                 if let entry {
                     var log = self.activityLog[taskID] ?? []
                     log.append(entry)
@@ -1250,8 +1309,7 @@ final class AppState {
                     if log.count > 50 { log.removeFirst(log.count - 50) }
                     self.activityLog[taskID] = log
                 }
-                if let raw = (try? JSONSerialization.jsonObject(with: rawLine))
-                    as? [String: Any] {
+                if let raw {
                     self.updateCurrentActivity(taskID: taskID, raw: raw)
                 }
             }
@@ -1264,6 +1322,9 @@ final class AppState {
         transcriptTailers[taskID]?.stop()
         transcriptTailers.removeValue(forKey: taskID)
         currentActivityByTaskID.removeValue(forKey: taskID)
+        // lastTranscriptPathByTaskID / seenTranscriptLineUUIDs は「同じ file
+        // に再 attach した時の dedup」を効かせるためにここで消さない。消すのは
+        // performCleanup (タスク削除 or done) のみ。
     }
 
     /// transcript 行 1 つから CurrentActivity を更新する。
