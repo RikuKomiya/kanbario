@@ -243,13 +243,17 @@ final class AppState {
     ///   使う (以前の `kanbario/` プレフィックスは旧版互換のため
     ///   `TaskCard.displayBranch` で剥がされるが、新規はすべて `feature/`)。
     ///
-    /// **Title の決定:** 空欄 OK。空なら body の先頭 10 文字 (grapheme cluster
-    /// 単位) を title に採用 → 日本語 prompt も「最初の 10 文字」を素直に取れる。
-    /// 10 文字超過時は末尾に `…` を付けて省略を示す。body も空なら `(Untitled)`。
+    /// **Title の決定:** 空欄 OK。空なら body の先頭 50 文字 (grapheme cluster
+    /// 単位) を title に採用 → 日本語 prompt も「最初の 50 文字」を素直に取れる。
+    /// 50 文字超過時は末尾に `…` を付けて省略を示す。body も空なら `(Untitled)`。
+    /// 50 文字は「カンバンカードに 2〜3 行で収まり、タスクの主旨が読み取れる」
+    /// 経験則の上限 (10 文字だと "pythonで書かれ…" のように冒頭だけで止まり
+    /// 何のタスクか判別できない、というユーザー指摘で 50 まで引き上げた)。
     func addTask(
         title: String,
         body: String,
         branch: String? = nil,
+        agent: AgentKind = .claude,
         tag: LLMTag? = nil,
         risk: RiskLevel? = nil,
         owner: String? = nil,
@@ -271,6 +275,7 @@ final class AppState {
             projectID: defaultProject.id,
             title: resolvedTitle,
             body: body,
+            agent: agent,
             status: .planning,
             branch: resolvedBranch,
             createdAt: now,
@@ -285,7 +290,7 @@ final class AppState {
         save()
     }
 
-    /// title が空 / 空白のみなら body の先頭 10 文字 (+ `…` if 長い) を title に。
+    /// title が空 / 空白のみなら body の先頭 50 文字 (+ `…` if 長い) を title に。
     /// body も空なら "(Untitled)"。改行は 1 つの空白に正規化して「1 行見出し」に。
     fileprivate static func resolveTitle(explicitTitle: String, body: String) -> String {
         let trimmed = explicitTitle.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -294,8 +299,12 @@ final class AppState {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\n", with: " ")
         if normalizedBody.isEmpty { return "(Untitled)" }
-        let head = normalizedBody.prefix(10)
-        return String(head) + (normalizedBody.count > 10 ? "…" : "")
+        // grapheme cluster 単位で 50 個切り出す。`String.prefix` は Substring
+        // を返し、こちらは Character (= grapheme cluster) ベースなので、絵文字
+        // / 結合文字 / surrogate pair を半分で切る事故にならない。`count` も
+        // grapheme cluster 数なので、超過判定が prefix の単位と揃う。
+        let head = normalizedBody.prefix(50)
+        return String(head) + (normalizedBody.count > 50 ? "…" : "")
     }
 
     /// title は全ステージで編集可能にする (ユーザーがタスク名を後から
@@ -321,6 +330,17 @@ final class AppState {
         guard let idx = tasks.firstIndex(where: { $0.id == id }) else { return }
         guard tasks[idx].status == .planning else { return }
         tasks[idx].body = body
+        tasks[idx].updatedAt = Date()
+        save()
+    }
+
+    /// agent も prompt / branch と同じく planning 中だけ変更可能。
+    /// セッション開始後に CLI を差し替えると resume / cleanup の意味論が壊れる。
+    func updateAgent(id: UUID, agent: AgentKind) {
+        guard let idx = tasks.firstIndex(where: { $0.id == id }) else { return }
+        guard tasks[idx].status == .planning else { return }
+        guard tasks[idx].agentKind != agent else { return }
+        tasks[idx].agent = agent
         tasks[idx].updatedAt = Date()
         save()
     }
@@ -586,7 +606,7 @@ final class AppState {
             // スキップして planning のまま戻る。
             try Task.checkCancellation()
 
-            startProgressByTaskID[task.id] = "claude を起動中…"
+            startProgressByTaskID[task.id] = "\(task.agentKind.displayName) を起動中…"
             let surface = try ClaudeSessionFactory.makeSurface(
                 task: task,
                 worktreeURL: worktreeURL,
@@ -594,6 +614,7 @@ final class AppState {
             )
             activeSurfaces[task.id] = surface
             worktreeURLByTaskID[task.id] = worktreeURL
+            activitiesByTaskID[task.id] = .running
             applyStatus(id: task.id, to: .inProgress)
         } catch is CancellationError {
             // ユーザーキャンセルは「通常経路」扱い。lastError に出さず、
@@ -680,7 +701,7 @@ final class AppState {
             )
             activeSurfaces[task.id] = surface
 
-            // 復帰直後の claude は「前回のやり取りを表示して入力待ち」=
+            // 復帰直後の agent は「前回のやり取りを表示して入力待ち」=
             // 意味論的に review (needsInput)。異常終了で inProgress に
             // 固まっていたタスクをここで正規化することで、次に prompt を
             // 打った瞬間に review → inProgress → stop → review の通常

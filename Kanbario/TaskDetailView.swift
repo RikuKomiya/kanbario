@@ -249,11 +249,11 @@ struct TaskDetailView: View {
 
     /// terminal エリア (tab bar + panes) を可視化するかの判定。
     ///
-    /// planning / done のタスクでは Claude セッションは存在しない or 既に
+    /// planning / done のタスクでは agent セッションは存在しない or 既に
     /// 終了済みなので、shell エリアを出す意味が薄い (shell タブは開けるが
     /// UI を圧迫するだけ)。これらのステージでは terminal を隠して
     /// planningBody / doneBody の編集 UI / メタ情報だけを全面表示する。
-    /// QA は review と同じ扱い — claude を resume して動かし直せる状態なので
+    /// QA は review と同じ扱い — agent を resume して動かし直せる状態なので
     /// terminal を出す。
     private var shouldShowTerminalArea: Bool {
         guard let task = appState.selectedTask else { return false }
@@ -263,13 +263,13 @@ struct TaskDetailView: View {
 
     private var tabBar: some View {
         HStack(spacing: 4) {
-            // Claude タブ (アクティブな task surface があれば)
+            // Agent タブ (アクティブな task surface があれば)
             if let id = appState.selectedTaskID,
                appState.activeSurfaces[id] != nil,
                let task = appState.tasks.first(where: { $0.id == id }) {
                 TabChip(
                     title: task.title,
-                    icon: "sparkles",
+                    icon: task.agentKind.terminalIcon,
                     isActive: activeLeftID == id,
                     showClose: false,
                     onSelect: {
@@ -474,7 +474,7 @@ struct TaskDetailView: View {
                     // 専用スピナーは入れず「復元中」だけ見せる。wt が無い /
                     // worktree が消えた等で resume 失敗した場合はこの表示で
                     // 留まる (lastError 側に silent fail している)。
-                    Hand("claude セッションを復元中…", size: 14, color: WF.ink2)
+                    Hand("\(task.agentKind.displayName) セッションを復元中…", size: 14, color: WF.ink2)
                     Hand("worktree: \(task.branch)", size: 11, color: WF.ink3)
                 }
             }
@@ -633,7 +633,7 @@ struct TaskDetailView: View {
     private func reviewNoTerminalBody(for task: TaskCard) -> some View {
         Hand("Review", size: 16, weight: .bold)
         Squiggle(width: 80)
-        Hand("claude プロセスは既に終了済み", size: 12, color: WF.ink3)
+        Hand("\(task.agentKind.displayName) プロセスは既に終了済み", size: 12, color: WF.ink3)
         if !task.body.isEmpty {
             Text(task.body)
                 .font(WFFont.mono(12))
@@ -698,7 +698,7 @@ struct TaskDetailView: View {
         if task.status != .planning { return "Only planning tasks can be started" }
         if !appState.canStartTasks { return "Choose a repository first (toolbar)" }
         if isStarting { return "Starting…" }
-        return "Start Claude (wt switch + claude spawn)"
+        return "Start \(task.agentKind.displayName) (wt switch + \(task.agentKind.executableName) spawn)"
     }
 }
 
@@ -755,6 +755,7 @@ fileprivate struct PlanningEditorFields: View {
     let task: TaskCard
     @State private var bodyDraft: String
     @State private var branchDraft: String
+    @State private var agentDraft: AgentKind
 
     init(task: TaskCard) {
         self.task = task
@@ -763,19 +764,39 @@ fileprivate struct PlanningEditorFields: View {
         // updatedAt を書き換えてカード並び順を乱す。
         _bodyDraft = State(initialValue: task.body)
         _branchDraft = State(initialValue: task.branch)
+        _agentDraft = State(initialValue: task.agentKind)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            agentBlock
             promptBlock
             branchBlock
         }
     }
 
     @ViewBuilder
+    private var agentBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Hand("Agent", size: 12, color: WF.ink2)
+            Picker("", selection: $agentDraft) {
+                ForEach(AgentKind.allCases) { agent in
+                    Text(agent.displayName).tag(agent)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 180)
+            .onChange(of: agentDraft) { _, new in
+                appState.updateAgent(id: task.id, agent: new)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var promptBlock: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Hand("Claude prompt", size: 16, weight: .bold)
+            Hand(agentDraft.promptLabel, size: 16, weight: .bold)
             Squiggle(width: 80)
             TextEditor(text: $bodyDraft)
                 .font(WFFont.mono(12))

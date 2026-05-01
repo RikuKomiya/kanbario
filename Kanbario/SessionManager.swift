@@ -1,8 +1,8 @@
 import Foundation
 
-/// Factory that builds a `TerminalSurface` configured to run Claude Code
+/// Factory that builds a `TerminalSurface` configured to run an agent CLI
 /// inside a worktree, with the env / PATH needed for GUI-launched Xcode builds
-/// to still see Homebrew-installed `claude` + node.
+/// to still see Homebrew-installed `claude` / `codex` + node.
 ///
 /// Milestone D refactor: libghostty now owns the PTY (see
 /// `GhosttyTerminalView.swift`), so this file no longer spawns via
@@ -11,12 +11,12 @@ import Foundation
 enum ClaudeSessionFactory {
 
     enum Error: Swift.Error, CustomStringConvertible {
-        case claudeNotFound
+        case executableNotFound(AgentKind)
 
         var description: String {
             switch self {
-            case .claudeNotFound:
-                return "claude binary not found in PATH. `brew install claude` or set explicit path."
+            case .executableNotFound(let agent):
+                return "\(agent.executableName) binary not found in PATH. Install \(agent.displayName) CLI or set PATH."
             }
         }
     }
@@ -36,36 +36,27 @@ enum ClaudeSessionFactory {
         resume: Bool = false,
         autoMode: Bool = false
     ) throws -> TerminalSurface {
-        // Bundle 同梱の shim (Resources/bin/claude) を最優先で起動する。
-        // shim が --settings で hook を注入し、内部で real claude を exec
-        // する設計 (cmux 流。spec.md §6.1)。
-        // claudeExecutable 引数は test/CLI 上書き、locateExecutable は
-        // Bundle なしで起動された場合 (xcodebuild test 等) のフォールバック。
-        let executable: URL
-        if let explicit = claudeExecutable {
-            executable = explicit
-        } else if let shim = Bundle.main.url(
-            forResource: "claude", withExtension: nil, subdirectory: "bin"
-        ), FileManager.default.isExecutableFile(atPath: shim.path) {
-            executable = shim
-        } else if let found = locateExecutable("claude") {
-            executable = found
-        } else {
-            throw Error.claudeNotFound
-        }
+        let agent = task.agentKind
+        let executable = try resolveExecutable(
+            for: agent,
+            explicitClaudeExecutable: claudeExecutable
+        )
 
-        // Inherit launchd env, then augment what claude / hook scripts need.
+        // Inherit launchd env, then augment what the agent / hook scripts need.
         var env = ProcessInfo.processInfo.environment
         env["KANBARIO_SURFACE_ID"] = task.id.uuidString
         env["KANBARIO_TASK_ID"] = task.id.uuidString
-        env["KANBARIO_SOCKET_PATH"] = AppState.defaultHookSocketPath()
-        // shim が --settings JSON を組み立てる際、hook command として
-        // この絶対パスを埋め込む。Bundle 外で動かすときは "kanbario" を
-        // PATH 解決させるため未設定のまま (shim 側でフォールバック)。
-        if let cli = Bundle.main.url(
-            forResource: "kanbario", withExtension: nil, subdirectory: "bin"
-        ) {
-            env["KANBARIO_HOOK_CLI_PATH"] = cli.path
+        env["KANBARIO_AGENT"] = agent.rawValue
+        if agent == .claude {
+            env["KANBARIO_SOCKET_PATH"] = AppState.defaultHookSocketPath()
+            // shim が --settings JSON を組み立てる際、hook command として
+            // この絶対パスを埋め込む。Bundle 外で動かすときは "kanbario" を
+            // PATH 解決させるため未設定のまま (shim 側でフォールバック)。
+            if let cli = Bundle.main.url(
+                forResource: "kanbario", withExtension: nil, subdirectory: "bin"
+            ) {
+                env["KANBARIO_HOOK_CLI_PATH"] = cli.path
+            }
         }
         // TERM は **常に xterm-ghostty を強制**する。
         // 理由: Xcode から debug run すると親 kanbario process に TERM=dumb が
@@ -96,11 +87,11 @@ enum ClaudeSessionFactory {
         //   libghostty, which mangles non-ASCII UTF-8 bytes (user observed
         //   mojibake on Japanese prompts).
         // - initial_input also changes UX: it behaves like the user typed the
-        //   prompt and is waiting to press Enter, not like `claude "body"`
+        //   prompt and is waiting to press Enter, not like `agent "body"`
         //   which executes immediately.
         //
         // ユーザの .zprofile / .zshenv で定義された PATH や環境変数
-        // (mise / asdf / direnv / API key など) を claude から見えるように
+        // (mise / asdf / direnv / API key など) を agent から見えるように
         // するため、**login shell** (-l) 経由で起動する。
         //
         //   sh -c → $SHELL -l -c 'exec <claude ...>'
@@ -112,28 +103,18 @@ enum ClaudeSessionFactory {
         //   などの不安定を引き起こす (cmux も surface command では interactive
         //   shell を直接起動しない)。.zshrc が読めない分は、ClaudeSessionFactory
         //   の augmentedPATH が mise/asdf 等の shim パスを補填している。
-        // - exec: claude で shell を置換して PID を 1 段減らし、Stop ボタンの
+        // - exec: agent で shell を置換して PID を 1 段減らし、Stop ボタンの
         //   SIGHUP 伝播経路を変えない
-        // autoMode = true の場合、claude に `--permission-mode bypassPermissions`
-        // を付けて tool 承認プロンプトを全スキップする。kanbario 内で動かす
-        // 前提の運用想定で、承認ダイアログで止まる UX を避ける。
-        // 注意: これは `--dangerously-skip-permissions` と同等の効果で、
-        // prompt で `rm -rf` 等も実行されるので開発環境での使用に限る。
-        let permissionFlag = autoMode ? " --permission-mode bypassPermissions" : ""
-
-        let claudeInvocation: String
-        if resume {
-            // --continue はこの cwd (= worktree) の最新会話を読み直す。
-            // kanbario は task 1 つに worktree 1 つなので session-id を
-            // 引数で指定する必要はない (--resume <id> ではなく --continue)。
-            claudeInvocation = "\(shellQuote(executable.path))\(permissionFlag) --continue"
-        } else if task.body.isEmpty {
-            claudeInvocation = "\(shellQuote(executable.path))\(permissionFlag)"
-        } else {
-            claudeInvocation = "\(shellQuote(executable.path))\(permissionFlag) \(shellQuote(task.body))"
-        }
+        let agentInvocation = invocation(
+            for: agent,
+            executable: executable,
+            prompt: task.body,
+            workingDirectory: worktreeURL.path,
+            resume: resume,
+            autoMode: autoMode
+        )
         let userShell = env["SHELL"] ?? "/bin/zsh"
-        let commandLine = "\(shellQuote(userShell)) -l -c \(shellQuote("exec " + claudeInvocation))"
+        let commandLine = "\(shellQuote(userShell)) -l -c \(shellQuote("exec " + agentInvocation))"
 
         return TerminalSurface(
             id: task.id,
@@ -142,6 +123,81 @@ enum ClaudeSessionFactory {
             initialInput: nil,
             environment: env
         )
+    }
+
+    private static func resolveExecutable(
+        for agent: AgentKind,
+        explicitClaudeExecutable: URL?
+    ) throws -> URL {
+        switch agent {
+        case .claude:
+            // Bundle 同梱の shim (Resources/bin/claude) を最優先で起動する。
+            // shim が --settings で hook を注入し、内部で real claude を exec
+            // する設計 (cmux 流。spec.md §6.1)。
+            // explicitClaudeExecutable 引数は test/CLI 上書き、locateExecutable は
+            // Bundle なしで起動された場合 (xcodebuild test 等) のフォールバック。
+            if let explicit = explicitClaudeExecutable {
+                return explicit
+            }
+            if let shim = Bundle.main.url(
+                forResource: "claude", withExtension: nil, subdirectory: "bin"
+            ), FileManager.default.isExecutableFile(atPath: shim.path) {
+                return shim
+            }
+            if let found = locateExecutable(agent.executableName) {
+                return found
+            }
+            throw Error.executableNotFound(agent)
+
+        case .codex:
+            if let found = locateExecutable(agent.executableName) {
+                return found
+            }
+            throw Error.executableNotFound(agent)
+        }
+    }
+
+    private static func invocation(
+        for agent: AgentKind,
+        executable: URL,
+        prompt: String,
+        workingDirectory: String,
+        resume: Bool,
+        autoMode: Bool
+    ) -> String {
+        switch agent {
+        case .claude:
+            // autoMode = true の場合、claude に `--permission-mode bypassPermissions`
+            // を付けて tool 承認プロンプトを全スキップする。kanbario 内で動かす
+            // 前提の運用想定で、承認ダイアログで止まる UX を避ける。
+            let permissionFlag = autoMode ? " --permission-mode bypassPermissions" : ""
+            if resume {
+                // --continue はこの cwd (= worktree) の最新会話を読み直す。
+                // kanbario は task 1 つに worktree 1 つなので session-id を
+                // 引数で指定する必要はない (--resume <id> ではなく --continue)。
+                return "\(shellQuote(executable.path))\(permissionFlag) --continue"
+            }
+            if prompt.isEmpty {
+                return "\(shellQuote(executable.path))\(permissionFlag)"
+            }
+            return "\(shellQuote(executable.path))\(permissionFlag) \(shellQuote(prompt))"
+
+        case .codex:
+            // Codex CLI は `codex [PROMPT]` が interactive TUI、`codex resume
+            // --last` が直近セッション復元。Claude の hook 互換は無いので、
+            // Kanbario 側の live activity は process close でのみ確定する。
+            // autoMode では承認プロンプトだけを飛ばし、sandbox は worktree 書き込み
+            // に留める。権限が足りない操作は Codex 側で失敗として扱わせる。
+            let bypassFlag = autoMode ? " --ask-for-approval never --sandbox workspace-write" : ""
+            let cdFlag = " --cd \(shellQuote(workingDirectory))"
+            if resume {
+                return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag) resume --last"
+            }
+            if prompt.isEmpty {
+                return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag)"
+            }
+            return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag) \(shellQuote(prompt))"
+        }
     }
 
     /// Single-quote shell escaping. Any `'` in the input is rewritten as

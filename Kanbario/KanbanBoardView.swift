@@ -365,11 +365,9 @@ struct MVPCard: View {
 
     private var topRow: some View {
         HStack(alignment: .center, spacing: 6) {
+            AgentPill(agent: task.agentKind)
             if let tag = task.tag {
                 LLMTagPill(tag: tag)
-            } else {
-                // 未設定時は薄い placeholder ピル
-                WFPill(color: WF.ink3) { Text("untagged") }
             }
             Spacer()
             // 優先順: starting > resuming > permission > activity。
@@ -581,7 +579,7 @@ struct MVPCard: View {
         if !appState.canStartTasks { return "Repo を選んでください (toolbar)" }
         if appState.activeSurfaces[task.id] != nil { return "既に起動済" }
         if isStarting { return "起動中…" }
-        return "Start Claude (裏で wt switch + claude 起動)"
+        return "Start \(task.agentKind.displayName) (裏で wt switch + \(task.agentKind.executableName) 起動)"
     }
 
     private var footerRow: some View {

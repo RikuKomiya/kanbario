@@ -203,6 +203,32 @@ struct WFAvatar: View {
 
 // MARK: - LLM category tag
 
+/// タスクを実行する agent の小さな識別ピル。
+struct AgentPill: View {
+    let agent: AgentKind
+    var size: CGFloat = 12
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: agent.terminalIcon)
+                .font(.system(size: 9, weight: .semibold))
+            Text(agent.displayName)
+                .font(WFFont.hand(size))
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 1)
+        .overlay(Capsule().stroke(color, lineWidth: 1))
+    }
+
+    private var color: Color {
+        switch agent {
+        case .claude: return WF.purple
+        case .codex:  return WF.accent
+        }
+    }
+}
+
 /// カードの RAG / Agent / Extract 等のタグピル。色はカテゴリごとに決まる。
 struct LLMTagPill: View {
     let tag: LLMTag
