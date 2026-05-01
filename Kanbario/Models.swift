@@ -2,9 +2,46 @@ import Foundation
 import CoreTransferable
 import SwiftUI
 
+// MARK: - AgentKind
+
+/// タスクを実行するローカル agent CLI。
+///
+/// 既存 state.json にはこの値が無いので、TaskCard 側では optional として保持し、
+/// 未設定なら `.claude` として扱う。これで Claude 専用時代のカードをそのまま
+/// 読み続けられる。
+enum AgentKind: String, Codable, CaseIterable, Hashable, Identifiable {
+    case claude
+    case codex
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex:  return "Codex"
+        }
+    }
+
+    var executableName: String {
+        switch self {
+        case .claude: return "claude"
+        case .codex:  return "codex"
+        }
+    }
+
+    var terminalIcon: String {
+        switch self {
+        case .claude: return "sparkles"
+        case .codex:  return "curlybraces"
+        }
+    }
+
+    var promptLabel: String { "\(displayName) prompt" }
+}
+
 // MARK: - TaskCard
 
-/// カンバンの 1 カード。Claude セッション 1 つと worktree 1 つに対応する。
+/// カンバンの 1 カード。agent セッション 1 つと worktree 1 つに対応する。
 /// Swift 標準の `Task` (concurrency) と名前衝突を避けるため `TaskCard` にしている。
 ///
 /// LLM メタフィールド (tag / risk / promptV / evalScore / owner / runs / fails /
@@ -16,7 +53,8 @@ struct TaskCard: Identifiable, Codable, Hashable {
     let id: UUID
     var projectID: UUID
     var title: String
-    var body: String           // Start 時に claude の初回プロンプトとして渡される
+    var body: String           // Start 時に agent CLI の初回プロンプトとして渡される
+    var agent: AgentKind? = nil
     var status: TaskStatus
     var branch: String         // "kanbario/<uuid>"
     var createdAt: Date
@@ -61,6 +99,9 @@ struct TaskCard: Identifiable, Codable, Hashable {
         }
         return branch
     }
+
+    /// 旧 state.json には agent が無いので Claude を既定値にする。
+    var agentKind: AgentKind { agent ?? .claude }
 }
 
 // MARK: - TaskStatus

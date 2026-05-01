@@ -208,6 +208,67 @@ struct TaskDetailView: View {
         }
     }
 
+    /// shell が libghostty に close を要請した瞬間 (`exit` 投入 / タブの ×)
+    /// に、分割の pane 割当を先回りで整える。
+    ///
+    /// `handleShellTabClosed` が触るのは AppState 側の共有 state (shellSurfaces /
+    /// shellTabOrderByTaskID / selectedTerminalIDByTaskID) だけ。分割モード
+    /// 自体 (`isTerminalExpanded`) と右ペインの mount 対象 (`rightTerminalID`,
+    /// TaskDetailView の `@State`) は view が自分で面倒を見る必要があるので、
+    /// ここでまとめて次のどちらかに落とす:
+    ///
+    /// 1. 閉じるのが **右ペインの shell** で、残りに左と被らない別 shell が
+    ///    あれば繰り上げ。無ければ split 自体を解除 (divider だけ残った
+    ///    empty 右ペインを作らない — これが元の symptom の根本原因)。
+    /// 2. 閉じるのが **左ペインの shell** で、`handleShellTabClosed` の再割り
+    ///    当て候補 (= 残り order の末尾) が `rightTerminalID` と衝突しそうな
+    ///    時も、右を別 shell に差し替え or split を解除する。同じ surface が
+    ///    左右 2 重 mount されると libghostty の NSView attach が後勝ちで
+    ///    入力が通らなくなる。
+    @MainActor
+    private func reconcileSplitOnShellClose(closingID: UUID) {
+        guard appState.isTerminalExpanded else { return }
+        let remaining = currentTaskShellIDs.filter { $0 != closingID }
+        let leftID = activeLeftID
+
+        // Case 1: 右ペインの shell が閉じる。
+        if rightTerminalID == closingID {
+            if let next = remaining.first(where: { $0 != leftID }) {
+                rightTerminalID = next
+            } else {
+                rightTerminalID = nil
+                appState.isTerminalExpanded = false
+            }
+            return
+        }
+
+        // Case 2: 左ペインの shell が閉じ、handleShellTabClosed が
+        // `rightTerminalID` と同じ shell を左ペインに繰り上げようとする衝突。
+        // handleShellTabClosed の再割当ルールは「直前のタブ or 末尾 or claude」
+        // なので、閉じる shell の直前の候補を予測する。
+        guard let ownerTID = appState.selectedTaskID,
+              appState.selectedTerminalIDByTaskID[ownerTID] == closingID else {
+            return
+        }
+        let fullOrder = appState.shellTabOrderByTaskID[ownerTID] ?? []
+        let removedIdx = fullOrder.firstIndex(of: closingID)
+        let projectedLeft: UUID?
+        if let idx = removedIdx, idx > 0 {
+            projectedLeft = remaining.indices.contains(idx - 1) ? remaining[idx - 1] : nil
+        } else {
+            projectedLeft = remaining.last
+        }
+        guard projectedLeft == rightTerminalID else { return }
+
+        // 右を別 shell に回す (左候補とも違うもの) か、候補が無ければ split 解除。
+        if let candidate = remaining.first(where: { $0 != projectedLeft }) {
+            rightTerminalID = candidate
+        } else {
+            rightTerminalID = nil
+            appState.isTerminalExpanded = false
+        }
+    }
+
     // MARK: - Meta strip
 
     @ViewBuilder
@@ -249,11 +310,11 @@ struct TaskDetailView: View {
 
     /// terminal エリア (tab bar + panes) を可視化するかの判定。
     ///
-    /// planning / done のタスクでは Claude セッションは存在しない or 既に
+    /// planning / done のタスクでは agent セッションは存在しない or 既に
     /// 終了済みなので、shell エリアを出す意味が薄い (shell タブは開けるが
     /// UI を圧迫するだけ)。これらのステージでは terminal を隠して
     /// planningBody / doneBody の編集 UI / メタ情報だけを全面表示する。
-    /// QA は review と同じ扱い — claude を resume して動かし直せる状態なので
+    /// QA は review と同じ扱い — agent を resume して動かし直せる状態なので
     /// terminal を出す。
     private var shouldShowTerminalArea: Bool {
         guard let task = appState.selectedTask else { return false }
@@ -263,13 +324,13 @@ struct TaskDetailView: View {
 
     private var tabBar: some View {
         HStack(spacing: 4) {
-            // Claude タブ (アクティブな task surface があれば)
+            // Agent タブ (アクティブな task surface があれば)
             if let id = appState.selectedTaskID,
                appState.activeSurfaces[id] != nil,
                let task = appState.tasks.first(where: { $0.id == id }) {
                 TabChip(
                     title: task.title,
-                    icon: "sparkles",
+                    icon: task.agentKind.terminalIcon,
                     isActive: activeLeftID == id,
                     showClose: false,
                     onSelect: {
@@ -330,9 +391,21 @@ struct TaskDetailView: View {
     /// 同一 surface を 2 ペインで mount すると attach が後勝ちになって
     /// 先に attach した側の入力が通らなくなる。split 時は rightTerminalID を
     /// 右ペイン「だけ」に配り、左ペインは残り全て、と明確に分離する。
+    ///
+    /// **Defense-in-depth:** `rightTerminalID` が生きている shell を指している
+    /// かを `shellSurfaces` で検証してから split を決める。`onCloseRequested`
+    /// の reconciliation で普段は先回りで掃除しているが、まだ発火していない
+    /// フレーム / 何らかの経路で surface が消えた場合に「divider だけ残った
+    /// 空の右ペイン」が出ないようにする保険。
     private var panesArea: some View {
-        let split = appState.isTerminalExpanded
-        let rightID = split ? rightTerminalID : nil
+        let effectiveRightID: UUID? = {
+            guard appState.isTerminalExpanded,
+                  let id = rightTerminalID,
+                  appState.shellSurfaces[id] != nil else { return nil }
+            return id
+        }()
+        let split = effectiveRightID != nil
+        let rightID = effectiveRightID
         let leftIDs = allSurfaceIDs.filter { $0 != rightID }
         let rightIDs = rightID.map { [$0] } ?? []
 
@@ -446,6 +519,12 @@ struct TaskDetailView: View {
                         terminalSurface: surface,
                         isSelected: show,
                         onCloseRequested: { _ in
+                            // split ペインの割当を先回りで整えてから AppState に
+                            // teardown を任せる。順番が逆だと、`handleShellTabClosed`
+                            // 実行直後の 1 frame だけ「rightTerminalID は dead UUID /
+                            // isTerminalExpanded は true」の不整合状態が出て、
+                            // divider + 空の右ペインがちらつく。
+                            reconcileSplitOnShellClose(closingID: id)
                             appState.handleShellTabClosed(id: id)
                         }
                     )
@@ -474,7 +553,7 @@ struct TaskDetailView: View {
                     // 専用スピナーは入れず「復元中」だけ見せる。wt が無い /
                     // worktree が消えた等で resume 失敗した場合はこの表示で
                     // 留まる (lastError 側に silent fail している)。
-                    Hand("claude セッションを復元中…", size: 14, color: WF.ink2)
+                    Hand("\(task.agentKind.displayName) セッションを復元中…", size: 14, color: WF.ink2)
                     Hand("worktree: \(task.branch)", size: 11, color: WF.ink3)
                 }
             }
@@ -633,7 +712,7 @@ struct TaskDetailView: View {
     private func reviewNoTerminalBody(for task: TaskCard) -> some View {
         Hand("Review", size: 16, weight: .bold)
         Squiggle(width: 80)
-        Hand("claude プロセスは既に終了済み", size: 12, color: WF.ink3)
+        Hand("\(task.agentKind.displayName) プロセスは既に終了済み", size: 12, color: WF.ink3)
         if !task.body.isEmpty {
             Text(task.body)
                 .font(WFFont.mono(12))
@@ -698,7 +777,7 @@ struct TaskDetailView: View {
         if task.status != .planning { return "Only planning tasks can be started" }
         if !appState.canStartTasks { return "Choose a repository first (toolbar)" }
         if isStarting { return "Starting…" }
-        return "Start Claude (wt switch + claude spawn)"
+        return "Start \(task.agentKind.displayName) (wt switch + \(task.agentKind.executableName) spawn)"
     }
 }
 
@@ -755,6 +834,7 @@ fileprivate struct PlanningEditorFields: View {
     let task: TaskCard
     @State private var bodyDraft: String
     @State private var branchDraft: String
+    @State private var agentDraft: AgentKind
 
     init(task: TaskCard) {
         self.task = task
@@ -763,19 +843,39 @@ fileprivate struct PlanningEditorFields: View {
         // updatedAt を書き換えてカード並び順を乱す。
         _bodyDraft = State(initialValue: task.body)
         _branchDraft = State(initialValue: task.branch)
+        _agentDraft = State(initialValue: task.agentKind)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            agentBlock
             promptBlock
             branchBlock
         }
     }
 
     @ViewBuilder
+    private var agentBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Hand("Agent", size: 12, color: WF.ink2)
+            Picker("", selection: $agentDraft) {
+                ForEach(AgentKind.allCases) { agent in
+                    Text(agent.displayName).tag(agent)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 180)
+            .onChange(of: agentDraft) { _, new in
+                appState.updateAgent(id: task.id, agent: new)
+            }
+        }
+    }
+
+    @ViewBuilder
     private var promptBlock: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Hand("Claude prompt", size: 16, weight: .bold)
+            Hand(agentDraft.promptLabel, size: 16, weight: .bold)
             Squiggle(width: 80)
             TextEditor(text: $bodyDraft)
                 .font(WFFont.mono(12))
