@@ -1,4 +1,6 @@
 import Foundation
+import Darwin  // kill(2), SIGKILL — onCancel escalation 用 (Foundation 経由でも
+               // 暗黙に見えるが、HookReceiver.swift と同じく明示する)
 
 /// `wt` (worktrunk) CLI を subprocess で呼ぶ薄いラッパー。
 ///
@@ -19,6 +21,16 @@ actor WorktreeService {
         enum CodingKeys: String, CodingKey {
             case path, branch
             case isCurrent = "is_current"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            path = try container.decode(String.self, forKey: .path)
+            // `wt list --format=json` can return `branch: null` for detached or
+            // special worktrees. Treat those as unmatchable entries instead of
+            // failing the whole Start flow.
+            branch = try container.decodeIfPresent(String.self, forKey: .branch) ?? ""
+            isCurrent = try container.decodeIfPresent(Bool.self, forKey: .isCurrent)
         }
     }
 
@@ -415,31 +427,42 @@ actor WorktreeService {
         // 完了時の全 data 返却の両立のため Data も蓄積する。
         let stdoutReader = LineReader()
         let stderrReader = LineReader()
-        if let onProgress {
-            stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-                let chunk = handle.availableData
-                if chunk.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                for line in stdoutReader.append(chunk) {
-                    if Self.shouldHideFromProgress(line) { continue }
-                    onProgress(line)
-                }
+        // **Pipe-buffer deadlock 防止 (kanbario "planning delete が消えない" fix):**
+        // Pipe バッファ (Darwin で ~64 KB) を drain せずに subprocess を放置すると、
+        // subprocess の `write(2)` が EAGAIN 待ちで block → kanbario 側の
+        // `waitUntilExit` も永久に戻らない、という古典的 deadlock になる。
+        // 旧実装は `onProgress` 渡された時だけ readabilityHandler を設定して
+        // いたため、`wt.remove` のような onProgress 無し path で出力量が多い
+        // と planning task の Delete が固まっていた。onProgress の有無に
+        // 関係なく **常に** 読み続けて、progress callback がある時だけ
+        // line callback を呼ぶ構造に変える。
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                return
             }
-            stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-                let chunk = handle.availableData
-                if chunk.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                for line in stderrReader.append(chunk) {
-                    // wt 本体が吐く「hook 未設定」系は silent skip 対象。
-                    // progress 表示にも漏らさない (ユーザー視点で「× …」が
-                    // カードに残って停滞しているように見える UX 劣化を回避)。
-                    if Self.shouldHideFromProgress(line) { continue }
-                    onProgress(line)
-                }
+            let lines = stdoutReader.append(chunk)
+            guard let onProgress else { return }
+            for line in lines {
+                if Self.shouldHideFromProgress(line) { continue }
+                onProgress(line)
+            }
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            let lines = stderrReader.append(chunk)
+            guard let onProgress else { return }
+            for line in lines {
+                // wt 本体が吐く「hook 未設定」系は silent skip 対象。
+                // progress 表示にも漏らさない (ユーザー視点で「× …」が
+                // カードに残って停滞しているように見える UX 劣化を回避)。
+                if Self.shouldHideFromProgress(line) { continue }
+                onProgress(line)
             }
         }
 
@@ -455,6 +478,17 @@ actor WorktreeService {
         // だけ見ていると、block 中の waitUntilExit が戻らず cancel 信号が
         // 届かないまま UI 上だけ「キャンセルした」表示になって subprocess が
         // 裏で延々残ってしまう。
+        //
+        // **SIGKILL escalation (kanbario の Starting 固着 fix):**
+        // wt が起動する hook subprocess には `bun install` / `uv sync` のような
+        // ネットワーク I/O で SIGTERM をすぐに飲まないものが混ざる。SIGTERM
+        // 単発では `waitUntilExit` が永久に戻らず、Task chain が前に進めない
+        // → `performStartTask` の defer が発火せず Starting バッジが残る /
+        // 同 worktree への `wt remove` も後ろで詰まって Delete も効かない、
+        // という連鎖症状になる。grace period を置いて SIGKILL に escalate
+        // することで、SIGTERM を握りつぶす subprocess が居ても確実に解放
+        // される。grace は「行儀の良い wt の post-flush に十分」「ユーザーが
+        // 体感する固着としては許容できる」境界として 2 秒。
         await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -464,9 +498,20 @@ actor WorktreeService {
             }
         } onCancel: {
             // onCancel は Task cancel の副作用として走る (isolation は
-            // nonisolated)。Process は thread-safe な terminate() を持つ。
-            if process.isRunning {
-                process.terminate()
+            // nonisolated)。Process は thread-safe な terminate() を持ち、
+            // pid_t も capture 可能 (kill(2) は Darwin 経由で signal を直送)。
+            guard process.isRunning else { return }
+            let pid = process.processIdentifier
+            process.terminate()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2) {
+                // 2 秒後にまだ生きている = SIGTERM を無視している subprocess。
+                // SIGKILL は kernel が直接終了させるので確実に exit する。
+                // 既に死んでいる (waitUntilExit が戻った) 場合は isRunning が
+                // false なので no-op。pid 再利用衝突を避けるために isRunning
+                // を必ず先に確認する。
+                if process.isRunning {
+                    kill(pid, SIGKILL)
+                }
             }
         }
 
