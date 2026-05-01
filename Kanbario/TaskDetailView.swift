@@ -208,6 +208,67 @@ struct TaskDetailView: View {
         }
     }
 
+    /// shell が libghostty に close を要請した瞬間 (`exit` 投入 / タブの ×)
+    /// に、分割の pane 割当を先回りで整える。
+    ///
+    /// `handleShellTabClosed` が触るのは AppState 側の共有 state (shellSurfaces /
+    /// shellTabOrderByTaskID / selectedTerminalIDByTaskID) だけ。分割モード
+    /// 自体 (`isTerminalExpanded`) と右ペインの mount 対象 (`rightTerminalID`,
+    /// TaskDetailView の `@State`) は view が自分で面倒を見る必要があるので、
+    /// ここでまとめて次のどちらかに落とす:
+    ///
+    /// 1. 閉じるのが **右ペインの shell** で、残りに左と被らない別 shell が
+    ///    あれば繰り上げ。無ければ split 自体を解除 (divider だけ残った
+    ///    empty 右ペインを作らない — これが元の symptom の根本原因)。
+    /// 2. 閉じるのが **左ペインの shell** で、`handleShellTabClosed` の再割り
+    ///    当て候補 (= 残り order の末尾) が `rightTerminalID` と衝突しそうな
+    ///    時も、右を別 shell に差し替え or split を解除する。同じ surface が
+    ///    左右 2 重 mount されると libghostty の NSView attach が後勝ちで
+    ///    入力が通らなくなる。
+    @MainActor
+    private func reconcileSplitOnShellClose(closingID: UUID) {
+        guard appState.isTerminalExpanded else { return }
+        let remaining = currentTaskShellIDs.filter { $0 != closingID }
+        let leftID = activeLeftID
+
+        // Case 1: 右ペインの shell が閉じる。
+        if rightTerminalID == closingID {
+            if let next = remaining.first(where: { $0 != leftID }) {
+                rightTerminalID = next
+            } else {
+                rightTerminalID = nil
+                appState.isTerminalExpanded = false
+            }
+            return
+        }
+
+        // Case 2: 左ペインの shell が閉じ、handleShellTabClosed が
+        // `rightTerminalID` と同じ shell を左ペインに繰り上げようとする衝突。
+        // handleShellTabClosed の再割当ルールは「直前のタブ or 末尾 or claude」
+        // なので、閉じる shell の直前の候補を予測する。
+        guard let ownerTID = appState.selectedTaskID,
+              appState.selectedTerminalIDByTaskID[ownerTID] == closingID else {
+            return
+        }
+        let fullOrder = appState.shellTabOrderByTaskID[ownerTID] ?? []
+        let removedIdx = fullOrder.firstIndex(of: closingID)
+        let projectedLeft: UUID?
+        if let idx = removedIdx, idx > 0 {
+            projectedLeft = remaining.indices.contains(idx - 1) ? remaining[idx - 1] : nil
+        } else {
+            projectedLeft = remaining.last
+        }
+        guard projectedLeft == rightTerminalID else { return }
+
+        // 右を別 shell に回す (左候補とも違うもの) か、候補が無ければ split 解除。
+        if let candidate = remaining.first(where: { $0 != projectedLeft }) {
+            rightTerminalID = candidate
+        } else {
+            rightTerminalID = nil
+            appState.isTerminalExpanded = false
+        }
+    }
+
     // MARK: - Meta strip
 
     @ViewBuilder
@@ -330,9 +391,21 @@ struct TaskDetailView: View {
     /// 同一 surface を 2 ペインで mount すると attach が後勝ちになって
     /// 先に attach した側の入力が通らなくなる。split 時は rightTerminalID を
     /// 右ペイン「だけ」に配り、左ペインは残り全て、と明確に分離する。
+    ///
+    /// **Defense-in-depth:** `rightTerminalID` が生きている shell を指している
+    /// かを `shellSurfaces` で検証してから split を決める。`onCloseRequested`
+    /// の reconciliation で普段は先回りで掃除しているが、まだ発火していない
+    /// フレーム / 何らかの経路で surface が消えた場合に「divider だけ残った
+    /// 空の右ペイン」が出ないようにする保険。
     private var panesArea: some View {
-        let split = appState.isTerminalExpanded
-        let rightID = split ? rightTerminalID : nil
+        let effectiveRightID: UUID? = {
+            guard appState.isTerminalExpanded,
+                  let id = rightTerminalID,
+                  appState.shellSurfaces[id] != nil else { return nil }
+            return id
+        }()
+        let split = effectiveRightID != nil
+        let rightID = effectiveRightID
         let leftIDs = allSurfaceIDs.filter { $0 != rightID }
         let rightIDs = rightID.map { [$0] } ?? []
 
@@ -446,6 +519,12 @@ struct TaskDetailView: View {
                         terminalSurface: surface,
                         isSelected: show,
                         onCloseRequested: { _ in
+                            // split ペインの割当を先回りで整えてから AppState に
+                            // teardown を任せる。順番が逆だと、`handleShellTabClosed`
+                            // 実行直後の 1 frame だけ「rightTerminalID は dead UUID /
+                            // isTerminalExpanded は true」の不整合状態が出て、
+                            // divider + 空の右ペインがちらつく。
+                            reconcileSplitOnShellClose(closingID: id)
                             appState.handleShellTabClosed(id: id)
                         }
                     )

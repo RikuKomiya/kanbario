@@ -307,6 +307,15 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
     /// fallback) and revisits once we wire action_cb notifications.
     fileprivate var cellSize: CGSize = .zero
 
+    /// Tokens for `NSWindow.didChangeScreenNotification` /
+    /// `NSApplication.didChangeScreenParametersNotification` observers. See
+    /// `registerScreenChangeObservers()` for the rationale — short version:
+    /// `layout()` / `viewDidChangeBackingProperties()` alone do not cover all
+    /// the "window moved to a different display" / "display resolution
+    /// changed" cases, so libghostty ends up stuck with the previous
+    /// display's pixel dims and vsync target.
+    private var screenChangeObservers: [NSObjectProtocol] = []
+
     init(terminalSurface: TerminalSurface) {
         self.surfaceId = terminalSurface.id
         self.terminalSurface = terminalSurface
@@ -319,6 +328,10 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
     }
 
     deinit {
+        for token in screenChangeObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        screenChangeObservers.removeAll()
         // Surface may already be torn down via explicit teardown(); if not,
         // the TerminalSurface deinit safety net will fire.
         terminalSurface = nil
@@ -338,6 +351,71 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
     private func setup() {
         wantsLayer = true
         layer?.masksToBounds = true
+        registerScreenChangeObservers()
+    }
+
+    /// Subscribe to screen change notifications so the embedded terminal
+    /// follows the host window onto a new display.
+    ///
+    /// Without these observers, `updateSurfaceSize()` only runs via
+    /// `layout()` / `viewDidMoveToWindow()` / `viewDidChangeBackingProperties()`:
+    /// - `layout()` needs the view bounds to actually change.
+    /// - `viewDidChangeBackingProperties()` only fires when the backing scale
+    ///   factor crosses a threshold. For display pairs with the same scale
+    ///   (e.g. two 2x retina panels) or some scale changes it silently skips —
+    ///   this is upstream ghostty issue #2731.
+    ///
+    /// On top of that, `ghostty_surface_set_display_id` is only called once in
+    /// `viewDidMoveToWindow`, so vsync stays pinned to the original screen's
+    /// display ID even after the window migrates.
+    ///
+    /// Fix: mirror upstream `SurfaceView_AppKit.swift` §793 — listen for the
+    /// window's screen change, re-bind the display ID, and force a backing /
+    /// size refresh on the next main-queue tick (so NSWindow has actually
+    /// finished migrating its backing store before we read scale/frame).
+    /// Also listen for app-wide screen parameter changes to cover resolution
+    /// changes / monitor hot-plug while the window stays put.
+    private func registerScreenChangeObservers() {
+        let center = NotificationCenter.default
+
+        let windowMoveToken = center.addObserver(
+            forName: NSWindow.didChangeScreenNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let window = self.window,
+                  let sender = note.object as? NSWindow,
+                  sender === window else { return }
+            self.handleScreenChange(window: window)
+        }
+
+        let screenParamsToken = center.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, let window = self.window else { return }
+            self.handleScreenChange(window: window)
+        }
+
+        screenChangeObservers = [windowMoveToken, screenParamsToken]
+    }
+
+    private func handleScreenChange(window: NSWindow) {
+        if let surface = runtimeSurface,
+           let displayID = window.screen?.displayID,
+           displayID != 0 {
+            ghostty_surface_set_display_id(surface, displayID)
+        }
+        // AppKit dispatches this notification *before* the window's backing
+        // store has fully migrated to the new screen — reading
+        // backingScaleFactor / convertToBacking immediately can still return
+        // the old display's values. One main-queue turn later they reflect
+        // the post-migration state.
+        DispatchQueue.main.async { [weak self] in
+            self?.updateSurfaceSize()
+        }
     }
 
     override var acceptsFirstResponder: Bool { true }
