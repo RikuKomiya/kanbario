@@ -194,11 +194,11 @@ final class GhosttyApp {
                 if let mimePtr = item.mime {
                     let mime = String(cString: mimePtr)
                     if mime.hasPrefix("text/plain") {
-                        GhosttyClipboard.writeString(value, to: location)
+                        GhosttyPasteboardHelper.writeString(value, to: location)
                         return
                     }
                 }
-                GhosttyClipboard.writeString(value, to: location)
+                GhosttyPasteboardHelper.writeString(value, to: location)
                 return
             }
         }
@@ -270,8 +270,15 @@ final class GhosttyApp {
         guard let ctx = callbackContext(from: userdata),
               let requestSurface = ctx.runtimeSurface else { return false }
 
+        // 画像 paste の temp file 書き出しが入りうるので main queue で処理する。
+        // ghostty の paste action はこの async 完了を待つ設計。
         DispatchQueue.main.async {
-            let text = GhosttyClipboard.readString(from: location) ?? ""
+            let text: String
+            if let pb = GhosttyPasteboardHelper.pasteboard(for: location) {
+                text = GhosttyPasteboardHelper.resolveForPaste(pb)
+            } else {
+                text = ""
+            }
             guard ctx.runtimeSurface == requestSurface else { return }
             text.withCString { ptr in
                 ghostty_surface_complete_clipboard_request(requestSurface, ptr, state, false)
@@ -418,30 +425,6 @@ enum GhosttyTerminfoInstaller {
     }
 }
 
-// Thin NSPasteboard wrapper for Ghostty's clipboard callbacks. Mirrors cmux's
-// text-only path in `GhosttyPasteboardHelper` — image / file-URL plumbing is
-// intentionally omitted for MVP.
-enum GhosttyClipboard {
-    private static let selectionPasteboard = NSPasteboard(
-        name: NSPasteboard.Name("com.mitchellh.ghostty.selection")
-    )
-
-    static func pasteboard(for location: ghostty_clipboard_e) -> NSPasteboard? {
-        switch location {
-        case GHOSTTY_CLIPBOARD_STANDARD: return .general
-        case GHOSTTY_CLIPBOARD_SELECTION: return selectionPasteboard
-        default: return nil
-        }
-    }
-
-    static func readString(from location: ghostty_clipboard_e) -> String? {
-        guard let pasteboard = pasteboard(for: location) else { return nil }
-        return pasteboard.string(forType: .string)
-    }
-
-    static func writeString(_ value: String, to location: ghostty_clipboard_e) {
-        guard let pasteboard = pasteboard(for: location) else { return }
-        pasteboard.clearContents()
-        pasteboard.setString(value, forType: .string)
-    }
-}
+// `GhosttyClipboard` (text-only MVP) は `GhosttyPasteboardHelper` に置き換え済み。
+// 画像 paste / drop は helper の resolveForPaste / resolveForDrop が temp-file →
+// shell-escaped path への変換を担う。

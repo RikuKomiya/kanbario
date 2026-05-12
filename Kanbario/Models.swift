@@ -55,6 +55,7 @@ struct TaskCard: Identifiable, Codable, Hashable {
     var title: String
     var body: String           // Start 時に agent CLI の初回プロンプトとして渡される
     var agent: AgentKind? = nil
+    var agentSessionID: String? = nil
     var status: TaskStatus
     var branch: String         // "kanbario/<uuid>"
     var createdAt: Date
