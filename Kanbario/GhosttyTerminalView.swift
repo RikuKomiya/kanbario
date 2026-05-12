@@ -315,6 +315,7 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
     /// changed" cases, so libghostty ends up stuck with the previous
     /// display's pixel dims and vsync target.
     private var screenChangeObservers: [NSObjectProtocol] = []
+    private var pendingMetricRefreshes: [DispatchWorkItem] = []
 
     init(terminalSurface: TerminalSurface) {
         self.surfaceId = terminalSurface.id
@@ -332,6 +333,8 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
             NotificationCenter.default.removeObserver(token)
         }
         screenChangeObservers.removeAll()
+        pendingMetricRefreshes.forEach { $0.cancel() }
+        pendingMetricRefreshes.removeAll()
         // Surface may already be torn down via explicit teardown(); if not,
         // the TerminalSurface deinit safety net will fire.
         terminalSurface = nil
@@ -352,6 +355,78 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
         wantsLayer = true
         layer?.masksToBounds = true
         registerScreenChangeObservers()
+        // drop register は updateDropRegistration(isSelected:) で動的に on/off。
+        // ZStack で mount された non-active な view が drop を奪わないように、
+        // 初期は unregister 状態で起動。`GhosttyTerminalView.updateNSView` から
+        // isSelected を反映して register を切り替える。
+    }
+
+    /// SwiftUI 親 (`GhosttyTerminalView`) から isSelected が変わるたびに呼ばれる。
+    ///
+    /// SwiftUI の `.allowsHitTesting(false)` は AppKit の drag dispatch には
+    /// 効かないため、ZStack で複数 surface を mount すると **全部** が drop
+    /// 候補になり、z-order 最前面の view が見えていなくても drop を受け取って
+    /// しまう (大元タスクのターミナルに全 drop が吸われる現象の原因)。
+    /// register / unregister を動的に切り替えれば、AppKit の drop 候補から
+    /// 物理的に除外できる。
+    func updateDropRegistration(isSelected: Bool) {
+        if isSelected {
+            if registeredDraggedTypes.isEmpty {
+                registerForDraggedTypes(Array(GhosttyNSView.dropTypes))
+            }
+        } else if !registeredDraggedTypes.isEmpty {
+            unregisterDraggedTypes()
+        }
+    }
+
+    // MARK: - NSDraggingDestination
+    //
+    // クラス本体に置くのは Swift extension で `@objc` メソッドを override すると、
+    // ファイル分割やコンパイル単位の事情で AppKit の dispatch が
+    // override されない (= drop が無反応になる) ケースを避けるため。
+    // upstream ghostty は extension 配置で動いているが、kanbario では
+    // 動作観測上クラス本体配置の方が確実だった。
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        let types = sender.draggingPasteboard.types ?? []
+        if Set(types).isDisjoint(with: GhosttyNSView.dropTypes) { return [] }
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        let types = sender.draggingPasteboard.types ?? []
+        if Set(types).isDisjoint(with: GhosttyNSView.dropTypes) { return [] }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        guard runtimeSurface != nil else { return false }
+
+        let payload = GhosttyPasteboardHelper.resolveForDrop(sender.draggingPasteboard)
+        guard !payload.isEmpty else { return false }
+
+        // `ghostty_surface_text` は内部で bracketed paste sentinel
+        // (`\x1b[200~ ... \x1b[201~`) を自動付与する (= paste action と同じ
+        // 経路)。手動で sentinel を付けると二重 wrapping で CLI の path 認識
+        // が壊れるので payload 単独で渡す。
+        //
+        // drag manager の戻り値後に AppKit が focus を元 view へ戻す可能性が
+        // あるため `DispatchQueue.main.async` で次 tick に逃がし、その中で
+        // `makeFirstResponder` + `set_focus` で window レベルの focus を
+        // terminal に固定してから text を流す。
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let surface = self.runtimeSurface else { return }
+            self.window?.makeFirstResponder(self)
+            ghostty_surface_set_focus(surface, true)
+            payload.withCString { ptr in
+                ghostty_surface_text(
+                    surface,
+                    ptr,
+                    UInt(payload.lengthOfBytes(using: .utf8))
+                )
+            }
+        }
+        return true
     }
 
     /// Subscribe to screen change notifications so the embedded terminal
@@ -403,18 +478,72 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
     }
 
     private func handleScreenChange(window: NSWindow) {
-        if let surface = runtimeSurface,
-           let displayID = window.screen?.displayID,
-           displayID != 0 {
-            ghostty_surface_set_display_id(surface, displayID)
-        }
+        updateSurfaceDisplayID(window: window)
         // AppKit dispatches this notification *before* the window's backing
         // store has fully migrated to the new screen — reading
         // backingScaleFactor / convertToBacking immediately can still return
         // the old display's values. One main-queue turn later they reflect
         // the post-migration state.
-        DispatchQueue.main.async { [weak self] in
-            self?.updateSurfaceSize()
+        scheduleSurfaceMetricsRefresh()
+    }
+
+    private func updateSurfaceDisplayID(window: NSWindow? = nil) {
+        guard let surface = runtimeSurface else { return }
+        let targetWindow = window ?? self.window
+        guard let displayID = targetWindow?.screen?.displayID, displayID != 0 else { return }
+        ghostty_surface_set_display_id(surface, displayID)
+    }
+
+    private func resolvedBackingScale() -> CGFloat {
+        let scale = window?.backingScaleFactor
+            ?? window?.screen?.backingScaleFactor
+            ?? layer?.contentsScale
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 1.0
+        guard scale.isFinite, scale > 0 else { return 1.0 }
+        return scale
+    }
+
+    private func syncLayerContentsScale() -> CGFloat {
+        let scale = resolvedBackingScale()
+        guard let layer, !scaleApproximatelyEqual(layer.contentsScale, scale) else {
+            return scale
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.contentsScale = scale
+        CATransaction.commit()
+        return scale
+    }
+
+    private func scaleApproximatelyEqual(_ lhs: CGFloat, _ rhs: CGFloat, epsilon: CGFloat = 0.0001) -> Bool {
+        abs(lhs - rhs) <= epsilon
+    }
+
+    func refreshSurfaceDisplayMetrics(forceRefresh: Bool = false) {
+        updateSurfaceDisplayID()
+        let didUpdate = updateSurfaceSize()
+        if forceRefresh || didUpdate {
+            terminalSurface?.refresh()
+        }
+    }
+
+    private func scheduleSurfaceMetricsRefresh() {
+        pendingMetricRefreshes.forEach { $0.cancel() }
+        pendingMetricRefreshes.removeAll()
+
+        for delay in [0.0, 0.05, 0.18] {
+            let work = DispatchWorkItem { [weak self] in
+                self?.refreshSurfaceDisplayMetrics(forceRefresh: true)
+            }
+            pendingMetricRefreshes.append(work)
+
+            if delay == 0 {
+                DispatchQueue.main.async(execute: work)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+            }
         }
     }
 
@@ -765,35 +894,45 @@ final class GhosttyNSView: NSView, GhosttySurfaceOwning {
 
         terminalSurface?.attachToView(self)
 
-        if let surface = terminalSurface?.surface,
-           let displayID = window.screen?.displayID,
-           displayID != 0 {
-            ghostty_surface_set_display_id(surface, displayID)
-        }
+        updateSurfaceDisplayID(window: window)
 
         superview?.layoutSubtreeIfNeeded()
         layoutSubtreeIfNeeded()
-        updateSurfaceSize()
+        scheduleSurfaceMetricsRefresh()
     }
 
     override func layout() {
         super.layout()
-        updateSurfaceSize()
+        refreshSurfaceDisplayMetrics()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        refreshSurfaceDisplayMetrics()
+    }
+
+    override func setBoundsSize(_ newSize: NSSize) {
+        super.setBoundsSize(newSize)
+        refreshSurfaceDisplayMetrics()
     }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        updateSurfaceSize()
+        scheduleSurfaceMetricsRefresh()
     }
 
-    private func updateSurfaceSize() {
-        guard let terminalSurface, terminalSurface.isLive else { return }
-        let xScale = window?.backingScaleFactor ?? layer?.contentsScale ?? NSScreen.main?.backingScaleFactor ?? 1.0
-        let yScale = xScale
-        let backing = convertToBacking(NSRect(origin: .zero, size: bounds.size)).size
-        terminalSurface.updateSize(
-            width: bounds.width,
-            height: bounds.height,
+    private func updateSurfaceSize() -> Bool {
+        guard let terminalSurface, terminalSurface.isLive else { return false }
+        let fallbackScale = syncLayerContentsScale()
+        let size = bounds.size
+        guard size.width > 0, size.height > 0 else { return false }
+
+        let backing = convertToBacking(NSRect(origin: .zero, size: size)).size
+        let xScale = backing.width > 0 ? backing.width / size.width : fallbackScale
+        let yScale = backing.height > 0 ? backing.height / size.height : fallbackScale
+        return terminalSurface.updateSize(
+            width: size.width,
+            height: size.height,
             xScale: xScale,
             yScale: yScale,
             backingSize: backing
@@ -1058,6 +1197,11 @@ struct GhosttyTerminalView: NSViewRepresentable {
 
     func updateNSView(_ nsView: GhosttyNSView, context: Context) {
         nsView.onCloseRequested = onCloseRequested
+        // ZStack で複数 surface を mount している時、`.allowsHitTesting(false)`
+        // は AppKit の drag dispatch には効かないので drop register を動的に
+        // 切り替える。これで非 active な裏タブが drop を奪う事故を防ぐ。
+        nsView.updateDropRegistration(isSelected: isSelected)
+        nsView.refreshSurfaceDisplayMetrics()
 
         // 選択状態が変わったら firstResponder を強制遷移。guard で「既に自分が
         // firstResponder」の場合はスキップし、毎 update ごとの冗長な

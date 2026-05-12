@@ -47,16 +47,14 @@ enum ClaudeSessionFactory {
         env["KANBARIO_SURFACE_ID"] = task.id.uuidString
         env["KANBARIO_TASK_ID"] = task.id.uuidString
         env["KANBARIO_AGENT"] = agent.rawValue
-        if agent == .claude {
-            env["KANBARIO_SOCKET_PATH"] = AppState.defaultHookSocketPath()
-            // shim が --settings JSON を組み立てる際、hook command として
-            // この絶対パスを埋め込む。Bundle 外で動かすときは "kanbario" を
-            // PATH 解決させるため未設定のまま (shim 側でフォールバック)。
-            if let cli = Bundle.main.url(
-                forResource: "kanbario", withExtension: nil, subdirectory: "bin"
-            ) {
-                env["KANBARIO_HOOK_CLI_PATH"] = cli.path
-            }
+        env["KANBARIO_SOCKET_PATH"] = AppState.defaultHookSocketPath()
+        // shim が hook command としてこの絶対パスを埋め込む。Bundle 外で
+        // 動かすときは "kanbario" を PATH 解決させるため未設定のまま
+        // (shim 側でフォールバック)。
+        if let cli = Bundle.main.url(
+            forResource: "kanbario", withExtension: nil, subdirectory: "bin"
+        ) {
+            env["KANBARIO_HOOK_CLI_PATH"] = cli.path
         }
         // TERM は **常に xterm-ghostty を強制**する。
         // 理由: Xcode から debug run すると親 kanbario process に TERM=dumb が
@@ -109,6 +107,7 @@ enum ClaudeSessionFactory {
             for: agent,
             executable: executable,
             prompt: task.body,
+            sessionID: task.agentSessionID,
             workingDirectory: worktreeURL.path,
             resume: resume,
             autoMode: autoMode
@@ -150,6 +149,11 @@ enum ClaudeSessionFactory {
             throw Error.executableNotFound(agent)
 
         case .codex:
+            if let shim = Bundle.main.url(
+                forResource: "codex", withExtension: nil, subdirectory: "bin"
+            ), FileManager.default.isExecutableFile(atPath: shim.path) {
+                return shim
+            }
             if let found = locateExecutable(agent.executableName) {
                 return found
             }
@@ -161,6 +165,7 @@ enum ClaudeSessionFactory {
         for agent: AgentKind,
         executable: URL,
         prompt: String,
+        sessionID: String?,
         workingDirectory: String,
         resume: Bool,
         autoMode: Bool
@@ -180,23 +185,34 @@ enum ClaudeSessionFactory {
             if prompt.isEmpty {
                 return "\(shellQuote(executable.path))\(permissionFlag)"
             }
-            return "\(shellQuote(executable.path))\(permissionFlag) \(shellQuote(prompt))"
+            // `--` で options を打ち切ってから prompt を渡す。markdown の箇条書き
+            // (`- foo`) を貼ると CLI が unknown option として弾くため。
+            return "\(shellQuote(executable.path))\(permissionFlag) -- \(shellQuote(prompt))"
 
         case .codex:
             // Codex CLI は `codex [PROMPT]` が interactive TUI、`codex resume
-            // --last` が直近セッション復元。Claude の hook 互換は無いので、
-            // Kanbario 側の live activity は process close でのみ確定する。
-            // autoMode では承認プロンプトだけを飛ばし、sandbox は worktree 書き込み
-            // に留める。権限が足りない操作は Codex 側で失敗として扱わせる。
-            let bypassFlag = autoMode ? " --ask-for-approval never --sandbox workspace-write" : ""
+            // <session-id>` が会話復元。Bundle shim が `-c hooks.*` を注入し、
+            // Stop / PermissionRequest / PreToolUse 等を kanbario に relay する。
+            // autoMode では `--dangerously-bypass-approvals-and-sandbox` で full
+            // access (= `--ask-for-approval never` + `--sandbox danger-full-access`
+            // 相当) として起動する。kanbario は worktree-1-task が前提で hook 側で
+            // 承認 UX / 監視を提供しているため、CLI 内蔵の sandbox / approval を
+            // 重ねがけする利点が薄く、workspace-write だと worktree 外参照
+            // (~/.cache / 隣接 project) で黙って失敗するケースを避ける狙い。
+            let bypassFlag = autoMode ? " --dangerously-bypass-approvals-and-sandbox" : ""
             let cdFlag = " --cd \(shellQuote(workingDirectory))"
             if resume {
+                if let sessionID, !sessionID.isEmpty {
+                    return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag) resume \(shellQuote(sessionID))"
+                }
                 return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag) resume --last"
             }
             if prompt.isEmpty {
                 return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag)"
             }
-            return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag) \(shellQuote(prompt))"
+            // codex CLI (clap) は positional の prompt が `-` 始まりだと
+            // unknown option として終了するので `--` で options を打ち切る。
+            return "\(shellQuote(executable.path))\(bypassFlag)\(cdFlag) -- \(shellQuote(prompt))"
         }
     }
 

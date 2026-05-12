@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# kanbario codex wrapper — relay Codex turn-complete events back to kanbario.
+#
+# When KANBARIO_SURFACE_ID is set, this script is being invoked from inside
+# kanbario's terminal surface. We inject `notify=[...]` so codex spawns the
+# bundled `kanbario` CLI with the agent-turn-complete JSON payload, which the
+# CLI converts into a `stop` HookMessage on the existing UDS.
+#
+# Codex 0.130 ignores `-c hooks.*` inline TOML overrides (they parse but no
+# hook is registered), so the previous SessionStart/Stop/etc. injection path
+# was dead. The `notify` config still works in 0.130 and gives us reliable
+# turn-end detection — enough to fix the "card stuck in inProgress" symptom.
+# Per-tool-call badges (PreToolUse / PostToolUse / PermissionRequest) are not
+# delivered via this path; they remain dark until codex restores `-c hooks.*`
+# or kanbario adopts `.codex/hooks.json` (blocked on undocumented trust hash
+# format as of 0.130).
+#
+# When KANBARIO_SURFACE_ID is unset, pass through to the real codex binary.
+
+set -u
+
+find_real_codex() {
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+    local IFS=:
+    for d in $PATH; do
+        [[ "$d" == "$self_dir" ]] && continue
+        [[ -x "$d/codex" ]] && printf '%s' "$d/codex" && return 0
+    done
+    return 1
+}
+
+toml_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    printf '%s' "$s"
+}
+
+if [[ -z "${KANBARIO_SURFACE_ID:-}" ]]; then
+    REAL_CODEX="$(find_real_codex)" || { echo "codex: real binary not found in PATH" >&2; exit 127; }
+    exec "$REAL_CODEX" "$@"
+fi
+
+HOOK_CLI="${KANBARIO_HOOK_CLI_PATH:-kanbario}"
+
+REAL_CODEX="$(find_real_codex)" || { echo "codex: real binary not found in PATH" >&2; exit 127; }
+
+# notify is a TOML array of strings: codex spawns argv[0] with the rest of the
+# array as fixed args, then appends one final argv with the event JSON. So our
+# CLI sees `argv[1]="codex-notify"`, `argv[2]=<json>`.
+NOTIFY_CFG="notify=[\"$(toml_escape "$HOOK_CLI")\",\"codex-notify\"]"
+
+# 一時的なデバッグ: shim 起動時に /tmp/kanbario-codex-debug.log へ環境を残す。
+# 動作確認できたらこのブロックは削除可。 (2026-05-09)
+{
+    printf '[%s] shim launched\n' "$(date +%FT%T)"
+    printf '  surface_id=%s\n' "${KANBARIO_SURFACE_ID:-<unset>}"
+    printf '  socket=%s\n' "${KANBARIO_SOCKET_PATH:-<unset>}"
+    printf '  hook_cli=%s (exists=%s, x=%s)\n' \
+        "$HOOK_CLI" \
+        "$([[ -e "$HOOK_CLI" ]] && echo yes || echo NO)" \
+        "$([[ -x "$HOOK_CLI" ]] && echo yes || echo NO)"
+    printf '  real_codex=%s\n' "$REAL_CODEX"
+    printf '  notify_cfg=%s\n' "$NOTIFY_CFG"
+    printf '  argv:'
+    printf ' %q' "$@"
+    printf '\n'
+} >> /tmp/kanbario-codex-debug.log 2>&1
+
+exec "$REAL_CODEX" -c "$NOTIFY_CFG" "$@"

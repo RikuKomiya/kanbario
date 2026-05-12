@@ -300,6 +300,7 @@ final class AppState {
             title: resolvedTitle,
             body: body,
             agent: agent,
+            agentSessionID: nil,
             status: .planning,
             branch: resolvedBranch,
             createdAt: now,
@@ -972,6 +973,7 @@ final class AppState {
             if current == .planning {
                 applyStatusFromHook(idx: idx, to: .inProgress)
             }
+            rememberAgentSessionID(idx: idx, payload: message.payload)
             activitiesByTaskID[id] = .running
             // transcript JSONL の tail を開始して live log を流し込む。
             // Claude Code は SessionStart の stdin JSON に
@@ -986,7 +988,7 @@ final class AppState {
             }
 
         case "prompt-submit", "pre-tool-use":
-            // ユーザー入力 or tool 実行 = claude が能動的に動いている。
+            // ユーザー入力 or tool 実行 = agent が能動的に動いている。
             // review / qa (= ユーザー待ち) からの「再開」を含めて inProgress へ。
             // qa は「review と同扱い」なので hook でも同列に扱う (ユーザーが
             // QA カラムで整理中に ⏎ を押した時も自然に inProgress へ戻す)。
@@ -994,18 +996,39 @@ final class AppState {
                 applyStatusFromHook(idx: idx, to: .inProgress)
             }
             activitiesByTaskID[id] = .running
+            updateCodexActivityFromHook(taskID: id, event: message.event, payload: message.payload)
             // 前ターンで来ていた permission 要求は「次のアクションが
             // 起きた時点」で解消したとみなしてクリア。
             pendingPermissionByTaskID.removeValue(forKey: id)
 
+        case "post-tool-use":
+            // tool 完了。Codex transcript tail が無い/遅れている場合でも、
+            // 実行中 tool バッジをここで片付けられる。
+            activitiesByTaskID[id] = .running
+            updateCodexActivityFromHook(taskID: id, event: message.event, payload: message.payload)
+            pendingPermissionByTaskID.removeValue(forKey: id)
+
         case "stop":
-            // ターン終了 = claude が「次のユーザー入力を待っています」状態。
+            // ターン終了 = agent が「次のユーザー入力を待っています」状態。
             // Kanban 上で見える状態遷移として review カラムへ移す。
             // done に到達済 (ユーザーが先に完了とした) なら触らない。
             if current == .inProgress {
                 applyStatusFromHook(idx: idx, to: .review)
             }
             activitiesByTaskID[id] = .needsInput
+            pendingPermissionByTaskID.removeValue(forKey: id)
+            // codex 0.130 では UserPromptSubmit hook が来ないので、
+            // stop (= notify agent-turn-complete) のタイミングで transcript tail
+            // を仕込み、以後の user_message を検知して review → inProgress に
+            // 戻せるようにする。fromTail=true で既往ターンの replay は無視。
+            if tasks[idx].agentKind == .codex,
+               transcriptTailers[id] == nil {
+                rememberAgentSessionID(idx: idx, payload: message.payload)
+                if let sessionID = Self.extractCodexThreadID(from: message.payload),
+                   let url = TranscriptTailer.codexRolloutURL(sessionID: sessionID) {
+                    startTranscriptTail(taskID: id, transcriptURL: url, fromTail: true)
+                }
+            }
 
         case "session-end":
             // claude プロセス exit。close_surface_cb 経路と冗長 (どちらか
@@ -1018,6 +1041,20 @@ final class AppState {
             pendingPermissionByTaskID.removeValue(forKey: id)
             // transcript tail を停止 (fd leak 防止)。
             stopTranscriptTail(taskID: id)
+
+        case "permission-request":
+            // Codex の承認要求。Claude の Notification hook と同じ UI surface
+            // (赤バッジ + OS 通知) に寄せる。
+            let body = Self.extractPermissionRequestMessage(
+                from: message.payload,
+                fallbackAgentName: tasks[idx].agentKind.displayName
+            )
+            pendingPermissionByTaskID[id] = body
+            NotificationService.shared.post(
+                title: tasks[idx].title,
+                body: body,
+                taskID: id
+            )
 
         case "notification":
             // claude の Notification hook は tool 承認待ち / idle タイムアウト等で
@@ -1046,6 +1083,63 @@ final class AppState {
         tasks[idx].status = status
         tasks[idx].updatedAt = Date()
         save()
+    }
+
+    private func rememberAgentSessionID(idx: Int, payload: String) {
+        guard let sessionID = Self.extractSessionID(from: payload),
+              !sessionID.isEmpty,
+              tasks[idx].agentSessionID != sessionID else { return }
+        tasks[idx].agentSessionID = sessionID
+        save()
+    }
+
+    /// Codex hook payload からカード上の簡易 activity を更新する。
+    /// Claude は transcript parser が主経路なので、この関数は Codex 形式だけを
+    /// best-effort で拾う。未知 schema は無視して状態遷移だけ維持する。
+    private func updateCodexActivityFromHook(
+        taskID: UUID,
+        event: String,
+        payload: String
+    ) {
+        guard let json = Self.parseJSONObject(payload) else { return }
+        var activity = currentActivityByTaskID[taskID] ?? CurrentActivity()
+        let timestamp = Date()
+
+        switch event {
+        case "prompt-submit":
+            activity.turnStartedAt = timestamp
+            activity.activeToolName = nil
+            activity.activeToolID = nil
+            activity.activeToolInputSummary = nil
+
+        case "pre-tool-use":
+            let toolName = json["tool_name"] as? String
+                ?? json["toolName"] as? String
+                ?? "Tool"
+            activity.activeToolName = toolName
+            activity.activeToolID = json["tool_use_id"] as? String
+            if let input = json["tool_input"] as? [String: Any] {
+                activity.activeToolInputSummary = Self.summarizeCodexToolInput(input)
+            } else {
+                activity.activeToolInputSummary = nil
+            }
+            if activity.turnStartedAt == nil {
+                activity.turnStartedAt = timestamp
+            }
+
+        case "post-tool-use":
+            let toolUseID = json["tool_use_id"] as? String
+            if toolUseID == nil || toolUseID == activity.activeToolID {
+                activity.activeToolName = nil
+                activity.activeToolID = nil
+                activity.activeToolInputSummary = nil
+            }
+
+        default:
+            break
+        }
+
+        currentActivityByTaskID[taskID] = activity
     }
 
     private func startHookReceiver() {
@@ -1204,6 +1298,26 @@ final class AppState {
 
     // MARK: - Notification payload
 
+    fileprivate static func parseJSONObject(_ payload: String) -> [String: Any]? {
+        guard let data = payload.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    fileprivate static func extractSessionID(from payload: String) -> String? {
+        guard let json = parseJSONObject(payload) else { return nil }
+        return (json["session_id"] as? String)
+            ?? (json["sessionId"] as? String)
+            ?? (json["thread-id"] as? String) // codex notify (agent-turn-complete) 形式
+    }
+
+    /// codex の notify payload (agent-turn-complete) から `thread-id` だけ抜く。
+    /// `extractSessionID` でも拾えるが、codex 専用経路で意図を明確にするため別 API。
+    fileprivate static func extractCodexThreadID(from payload: String) -> String? {
+        guard let json = parseJSONObject(payload) else { return nil }
+        let id = (json["thread-id"] as? String) ?? (json["threadId"] as? String) ?? ""
+        return id.isEmpty ? nil : id
+    }
+
     /// Notification hook の stdin JSON から `message` フィールドだけ抜く。
     /// Claude Code は `{ "hook_event_name": "Notification", "message": "..." }`
     /// 形式で渡してくる (他フィールドは無視してよい)。
@@ -1212,6 +1326,28 @@ final class AppState {
         struct NotificationPayload: Decodable { let message: String? }
         let decoded = try? JSONDecoder().decode(NotificationPayload.self, from: data)
         return decoded?.message?.isEmpty == false ? decoded?.message : nil
+    }
+
+    fileprivate static func extractPermissionRequestMessage(
+        from payload: String,
+        fallbackAgentName: String
+    ) -> String {
+        guard let json = parseJSONObject(payload) else {
+            return "\(fallbackAgentName) が承認を求めています"
+        }
+        let toolName = json["tool_name"] as? String
+            ?? json["toolName"] as? String
+            ?? "tool"
+        let input = json["tool_input"] as? [String: Any]
+        let description = input?["description"] as? String
+        let command = input?["command"] as? String
+        let detail = [description, command]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        if let detail {
+            return "\(fallbackAgentName) requests approval for \(toolName): \(trimForBadge(detail))"
+        }
+        return "\(fallbackAgentName) requests approval for \(toolName)"
     }
 
     /// Notification message が tool permission / approval 要求系かを粗く判定。
@@ -1240,19 +1376,37 @@ final class AppState {
         payload: String,
         worktreeURL: URL?
     ) -> URL? {
-        guard let data = payload.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return nil }
+        guard let json = parseJSONObject(payload) else { return nil }
         if let path = json["transcript_path"] as? String, !path.isEmpty {
             return URL(fileURLWithPath: path)
         }
-        let sessionID = (json["session_id"] as? String)
-            ?? (json["sessionId"] as? String)
-            ?? ""
+        let sessionID = extractSessionID(from: payload) ?? ""
         guard !sessionID.isEmpty, let worktreeURL else { return nil }
         return TranscriptTailer.transcriptURL(
             for: worktreeURL, sessionID: sessionID
         )
+    }
+
+    fileprivate static func summarizeCodexToolInput(_ input: [String: Any]) -> String? {
+        if let command = input["command"] as? String, !command.isEmpty {
+            return trimForBadge(command)
+        }
+        if let description = input["description"] as? String, !description.isEmpty {
+            return trimForBadge(description)
+        }
+        guard let key = input.keys.sorted().first else { return nil }
+        let value = input[key].map { "\($0)" } ?? ""
+        return "\(key): \(trimForBadge(value))"
+    }
+
+    fileprivate static func trimForBadge(_ s: String, limit: Int = 80) -> String {
+        let single = s
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if single.count > limit {
+            return String(single.prefix(limit)) + "…"
+        }
+        return single
     }
 
     // MARK: - Transcript tail
@@ -1272,7 +1426,8 @@ final class AppState {
     ///    pre-filter して skip する。
     fileprivate func startTranscriptTail(
         taskID: UUID,
-        transcriptURL: URL
+        transcriptURL: URL,
+        fromTail: Bool = false
     ) {
         guard transcriptTailers[taskID] == nil else { return }
         let newPath = transcriptURL.path
@@ -1283,7 +1438,7 @@ final class AppState {
         }
         lastTranscriptPathByTaskID[taskID] = newPath
 
-        let tailer = TranscriptTailer(transcriptURL: transcriptURL) { [weak self] entry, rawLine in
+        let tailer = TranscriptTailer(transcriptURL: transcriptURL, fromTail: fromTail) { [weak self] entry, rawLine in
             // closure boundary を越えるのは Sendable な Data まで。
             // dict 化は MainActor 内で行う (Any の Sendable 違反を回避)。
             Task { @MainActor in
@@ -1338,6 +1493,11 @@ final class AppState {
     /// tool_result は Claude の transcript では user message として記録される
     /// (Claude SDK の慣例)。この点を踏まえて分岐する。
     private func updateCurrentActivity(taskID: UUID, raw: [String: Any]) {
+        if let payload = raw["payload"] as? [String: Any] {
+            updateCodexTranscriptActivity(taskID: taskID, payload: payload)
+            return
+        }
+
         var activity = currentActivityByTaskID[taskID] ?? CurrentActivity()
         let type = (raw["type"] as? String) ?? ""
         let timestamp = (raw["timestamp"] as? String)
@@ -1398,6 +1558,65 @@ final class AppState {
                     }
                 }
             }
+        default:
+            break
+        }
+
+        currentActivityByTaskID[taskID] = activity
+    }
+
+    private func updateCodexTranscriptActivity(
+        taskID: UUID,
+        payload: [String: Any]
+    ) {
+        var activity = currentActivityByTaskID[taskID] ?? CurrentActivity()
+        let type = payload["type"] as? String ?? ""
+
+        switch type {
+        case "user_message":
+            activity.turnStartedAt = Date()
+            activity.activeToolName = nil
+            activity.activeToolID = nil
+            activity.activeToolInputSummary = nil
+            // codex 0.130 では UserPromptSubmit hook が `-c hooks.*` 経路では
+            // 発火しない (notify は agent-turn-complete のみ)。代わりに
+            // transcript JSONL の user_message を見て review/qa/planning から
+            // InProgress に戻す (handleHook の prompt-submit 等価)。
+            // tail は fromTail=true で attach しているので、ここに到達するのは
+            // 必ず attach 後に書き込まれた live エントリ = 新しいユーザー入力。
+            if let idx = tasks.firstIndex(where: { $0.id == taskID }) {
+                let current = tasks[idx].status
+                if current.isReviewLike || current == .planning {
+                    applyStatusFromHook(idx: idx, to: .inProgress)
+                }
+                activitiesByTaskID[taskID] = .running
+                pendingPermissionByTaskID.removeValue(forKey: taskID)
+            }
+
+        case "function_call", "custom_tool_call", "web_search_call":
+            activity.activeToolName = (payload["name"] as? String)
+                ?? (type == "web_search_call" ? "web_search" : "tool")
+            activity.activeToolID = payload["call_id"] as? String
+            let args = (payload["arguments"] as? String)
+                ?? (payload["input"] as? String)
+                ?? ""
+            activity.activeToolInputSummary = args.isEmpty
+                ? nil
+                : Self.trimForBadge(args)
+            if activity.turnStartedAt == nil {
+                activity.turnStartedAt = Date()
+            }
+
+        case "function_call_output", "custom_tool_call_output",
+             "exec_command_end", "patch_apply_end", "web_search_end",
+             "agent_message", "task_complete":
+            let callID = payload["call_id"] as? String
+            if callID == nil || callID == activity.activeToolID {
+                activity.activeToolName = nil
+                activity.activeToolID = nil
+                activity.activeToolInputSummary = nil
+            }
+
         default:
             break
         }

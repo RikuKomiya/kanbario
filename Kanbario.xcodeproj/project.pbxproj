@@ -10,6 +10,7 @@
 		F281B25A2F94025200856A2D /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F281B2592F94025200856A2D /* GhosttyKit.xcframework */; };
 		F281B4012F94900000856A2D /* Resources/bin/claude in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B4002F94900000856A2D /* Resources/bin/claude */; };
 		F281B4022F94900000856A2D /* kanbario in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B3042F94800000856A2D /* kanbario */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		F281B4072F94900000856A2D /* Resources/bin/codex in Copy Hook Bin */ = {isa = PBXBuildFile; fileRef = F281B4062F94900000856A2D /* Resources/bin/codex */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,6 +45,7 @@
 			dstSubfolderSpec = 7;
 			files = (
 				F281B4012F94900000856A2D /* Resources/bin/claude in Copy Hook Bin */,
+				F281B4072F94900000856A2D /* Resources/bin/codex in Copy Hook Bin */,
 				F281B4022F94900000856A2D /* kanbario in Copy Hook Bin */,
 			);
 			name = "Copy Hook Bin";
@@ -58,6 +60,7 @@
 		F281B2592F94025200856A2D /* GhosttyKit.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = GhosttyKit.xcframework; sourceTree = SOURCE_ROOT; };
 		F281B3042F94800000856A2D /* kanbario */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = kanbario; sourceTree = BUILT_PRODUCTS_DIR; };
 		F281B4002F94900000856A2D /* Resources/bin/claude */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.sh; path = Resources/bin/claude; sourceTree = "<group>"; };
+		F281B4062F94900000856A2D /* Resources/bin/codex */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.script.sh; path = Resources/bin/codex; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -122,6 +125,7 @@
 				F281B1F52F93787C00856A2D /* Kanbario */,
 				F281B3032F94800000856A2D /* CLI */,
 				F281B4002F94900000856A2D /* Resources/bin/claude */,
+				F281B4062F94900000856A2D /* Resources/bin/codex */,
 				F281B2032F93787E00856A2D /* KanbarioTests */,
 				F281B20D2F93787F00856A2D /* KanbarioUITests */,
 				F281B2582F94025200856A2D /* Frameworks */,
@@ -514,7 +518,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 444539945L;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -534,7 +538,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lc++",
@@ -559,7 +563,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 444539945L;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -579,7 +583,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lc++",
@@ -602,11 +606,11 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 444539945L;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.KanbarioTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -623,11 +627,11 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 444539945L;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.KanbarioTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -643,10 +647,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 444539945L;
 				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.KanbarioUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
@@ -662,10 +666,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = 444539945L;
 				GENERATE_INFOPLIST_FILE = YES;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.0.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.KanbarioUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;

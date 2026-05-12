@@ -27,6 +27,7 @@ final class TranscriptTailer {
     }
 
     private let transcriptURL: URL
+    private let fromTail: Bool
     private let onEvent: @Sendable (LogEntry?, Data) -> Void
     private let queue = DispatchQueue(label: "kanbario.transcript.tail", qos: .utility)
 
@@ -43,11 +44,17 @@ final class TranscriptTailer {
     ///   parse 結果ではなく bytes を渡す。呼び出し側は必要に応じて
     ///   `JSONSerialization` で再 parse する (MainActor 上で実行される
     ///   想定なので dict を作っても境界を越えない)。
+    /// - `fromTail`: true なら attach 時に既存内容を読み込まず EOF まで seek する。
+    ///   codex 経路は session-start hook が来ない代わりに stop hook 後に attach
+    ///   するため、既往 turn を replay すると Review → InProgress 誤遷移を起こす。
+    ///   default false で Claude 側の挙動 (履歴含めて全行 callback) を維持。
     init(
         transcriptURL: URL,
+        fromTail: Bool = false,
         onEvent: @escaping @Sendable (LogEntry?, Data) -> Void
     ) {
         self.transcriptURL = transcriptURL
+        self.fromTail = fromTail
         self.onEvent = onEvent
     }
 
@@ -93,8 +100,13 @@ final class TranscriptTailer {
         guard let handle = try? FileHandle(forReadingFrom: transcriptURL) else { return }
         self.fileHandle = handle
 
-        // 初回 open 直後に既存内容も全て読む (履歴を表示に含めるため)。
-        drainAvailable()
+        if fromTail {
+            // codex 経路: 既存内容を破棄して末尾から監視する。詳細は init コメント。
+            _ = try? handle.seekToEnd()
+        } else {
+            // 初回 open 直後に既存内容も全て読む (履歴を表示に含めるため)。
+            drainAvailable()
+        }
 
         let fd = handle.fileDescriptor
         let src = DispatchSource.makeFileSystemObjectSource(
@@ -150,6 +162,11 @@ final class TranscriptTailer {
     /// 呼び出し側が structured data を欲しい場合は TranscriptTailer の
     /// onEvent に渡ってくる raw JSON dict を直接見ること。
     static func buildEntry(from json: [String: Any]) -> LogEntry? {
+        if let payload = json["payload"] as? [String: Any],
+           let entry = buildCodexEntry(from: payload, outer: json) {
+            return entry
+        }
+
         let type = (json["type"] as? String) ?? ""
         let timestampStr = json["timestamp"] as? String
         let timestamp = timestampStr.flatMap {
@@ -168,6 +185,70 @@ final class TranscriptTailer {
                 return entry
             }
             return nil
+        default:
+            return nil
+        }
+    }
+
+    private static func buildCodexEntry(
+        from payload: [String: Any],
+        outer: [String: Any]
+    ) -> LogEntry? {
+        let timestampStr = (payload["timestamp"] as? String)
+            ?? (outer["timestamp"] as? String)
+        let timestamp = timestampStr.flatMap {
+            ISO8601DateFormatter().date(from: $0)
+        } ?? Date()
+        let type = payload["type"] as? String ?? ""
+
+        switch type {
+        case "user_message":
+            guard let message = payload["message"] as? String, !message.isEmpty else { return nil }
+            return LogEntry(kind: .user, text: trimmed(message), timestamp: timestamp)
+
+        case "agent_message":
+            guard let message = payload["message"] as? String, !message.isEmpty else { return nil }
+            return LogEntry(kind: .assistant, text: trimmed(message), timestamp: timestamp)
+
+        case "message":
+            let role = payload["role"] as? String ?? ""
+            let text = extractCodexContentText(payload["content"])
+            guard !text.isEmpty else { return nil }
+            return LogEntry(
+                kind: role == "user" ? .user : .assistant,
+                text: trimmed(text),
+                timestamp: timestamp
+            )
+
+        case "function_call", "custom_tool_call", "web_search_call":
+            let name = (payload["name"] as? String)
+                ?? (type == "web_search_call" ? "web_search" : "tool")
+            let args = (payload["arguments"] as? String)
+                ?? (payload["input"] as? String)
+                ?? ""
+            return LogEntry(
+                kind: .tool,
+                text: "\(name)\(summarizeCodexArguments(args))",
+                timestamp: timestamp
+            )
+
+        case "exec_command_end":
+            guard let command = payload["command"] as? String else { return nil }
+            return LogEntry(
+                kind: .tool,
+                text: "Bash \(trimmed(command))",
+                timestamp: timestamp
+            )
+
+        case "patch_apply_end":
+            return LogEntry(kind: .tool, text: "apply_patch", timestamp: timestamp)
+
+        case "task_started":
+            return LogEntry(kind: .system, text: "Codex started", timestamp: timestamp)
+
+        case "task_complete":
+            return LogEntry(kind: .system, text: "Codex completed", timestamp: timestamp)
+
         default:
             return nil
         }
@@ -211,6 +292,38 @@ final class TranscriptTailer {
             }
         }
         return nil
+    }
+
+    private static func extractCodexContentText(_ content: Any?) -> String {
+        if let s = content as? String { return s }
+        if let blocks = content as? [[String: Any]] {
+            for block in blocks {
+                if let text = block["text"] as? String {
+                    return text
+                }
+                if let text = block["content"] as? String {
+                    return text
+                }
+                if let inputText = block["input_text"] as? String {
+                    return inputText
+                }
+                if let outputText = block["output_text"] as? String {
+                    return outputText
+                }
+            }
+        }
+        return ""
+    }
+
+    private static func summarizeCodexArguments(_ arguments: String) -> String {
+        let trimmedArgs = arguments
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedArgs.isEmpty else { return "" }
+        let truncated = trimmedArgs.count > 40
+            ? String(trimmedArgs.prefix(40)) + "…"
+            : trimmedArgs
+        return " (\(truncated))"
     }
 
     /// 先頭の 1 key-value を `(key: value-trimmed)` 形式で短く。UI 行が 1 行 mono
@@ -261,5 +374,43 @@ final class TranscriptTailer {
             .appendingPathComponent("projects")
             .appendingPathComponent(encoded)
             .appendingPathComponent("\(sessionID).jsonl")
+    }
+
+    /// codex の session-id (= UUIDv7 の thread-id) から rollout JSONL の URL を解決する。
+    ///
+    /// codex CLI 0.130 のレイアウト:
+    ///   `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<YYYY>-<MM>-<DD>T<HH>-<MM>-<SS>-<sessionID>.jsonl`
+    /// (ディレクトリは UTC 日付、時刻も UTC)。
+    ///
+    /// UUIDv7 の先頭 48 bit が unix-ms タイムスタンプ なのでそこから候補日を導出し、
+    /// 同日 + 前後 1 日 (TZ 跨ぎへの保険) のディレクトリ内で suffix-match する。
+    /// 走査範囲が 3 ディレクトリ × ファイル数だけなので I/O は軽い。
+    static func codexRolloutURL(sessionID: String) -> URL? {
+        guard !sessionID.isEmpty else { return nil }
+        let cleaned = sessionID.replacingOccurrences(of: "-", with: "")
+        guard cleaned.count >= 12,
+              let ms = UInt64(cleaned.prefix(12), radix: 16) else { return nil }
+        let baseDate = Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0)
+
+        var dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy/MM/dd"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")
+        let cal = Calendar(identifier: .gregorian)
+
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let root = home.appendingPathComponent(".codex").appendingPathComponent("sessions")
+        let suffix = "-\(sessionID).jsonl"
+
+        for offset in [0, -1, 1] {
+            guard let candidate = cal.date(byAdding: .day, value: offset, to: baseDate)
+            else { continue }
+            let dir = root.appendingPathComponent(dateFormatter.string(from: candidate))
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+            else { continue }
+            for name in entries where name.hasSuffix(suffix) {
+                return dir.appendingPathComponent(name)
+            }
+        }
+        return nil
     }
 }
